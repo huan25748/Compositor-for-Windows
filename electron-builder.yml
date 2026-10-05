@@ -1,0 +1,37 @@
+# electron-builder 配置：打包 Windows 可执行文件
+#   - nsis     -> 安装包（可选安装目录、桌面与开始菜单快捷方式）
+#   - portable -> 免安装单文件 exe，双击即用
+appId: com.wonderassembly.compositor.win
+productName: Compositor
+copyright: MIT — 复刻自 github.com/robbietilton/Compositor
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - package.json
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  icon: build/icon.ico
+
+nsis:
+  artifactName: Compositor-Setup-${version}.${ext}
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Compositor
+  language: '2052' # 简体中文
+
+portable:
+  artifactName: Compositor-${version}-portable.${ext}

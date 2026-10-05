@@ -1,0 +1,24 @@
+{
+  "name": "compositor-win",
+  "productName": "Compositor",
+  "version": "1.1.0",
+  "description": "Compositor for Windows — 免费开源的图层合成器（简体中文版）",
+  "license": "MIT",
+  "author": "Compositor for Windows",
+  "type": "module",
+  "main": "dist/main/main.cjs",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "start": "node build.mjs && electron .",
+    "test": "node --test \"tests/*.test.ts\"",
+    "dist": "node build.mjs && electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "electron": "^44.5.1",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.25.10",
+    "typescript": "^5.9.2"
+  }
+}
