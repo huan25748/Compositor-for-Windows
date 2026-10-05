@@ -238,6 +238,21 @@ export interface FontRun {
   fontName: string
 }
 
+/** 部分文字改字号。官方 .comp 没有这一项，是本机扩展：官方读到会忽略，我们自己完整保留。 */
+export interface SizeRun {
+  location: number
+  length: number
+  fontSize: number
+}
+
+/** 文字描边：沿字形边缘向外扩展一层实色（不是发散的模糊）。本机扩展，官方 .comp 没有。 */
+export interface TextStroke {
+  width: number
+  red: number
+  green: number
+  blue: number
+}
+
 export interface TextMetadata {
   content: string
   fontName: string
@@ -251,6 +266,8 @@ export interface TextMetadata {
   boxSize?: [number, number]
   colorRuns?: ColorRun[]
   fontRuns?: FontRun[]
+  sizeRuns?: SizeRun[]
+  textStroke?: TextStroke
 }
 
 /** 形状图层元数据。 */

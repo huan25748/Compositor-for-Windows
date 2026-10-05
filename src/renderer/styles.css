@@ -1,22 +1,71 @@
-/* Compositor for Windows —— 深色界面，中文排版 */
+/* Compositor for Windows —— 深色界面，中文排版
+ *
+ * 令牌体系参照 Morupixel 的设计系统（docs/DESIGN_SYSTEM.md），三条原则：
+ *   1. 图像是主角：UI 一律中性灰，退到后面；屏幕上最亮的应当是被编辑的图像。
+ *   2. 用表面深度表示结构：底 → 面板卡 → 按钮（比面板亮）→ 输入框（比面板暗），
+ *      线条只在需要辅助这个区分时才用。
+ *   3. 蓝色只用于状态：--accent 是"选择 / 焦点 / 进度"的淡蓝，--primary 是每屏
+ *      唯一主动作按钮的深蓝。两者都不拿来做装饰。
+ */
 
 :root {
-  --bg: #1b1d21;
-  --bg-panel: #24262b;
-  --bg-panel-2: #2b2e34;
-  --bg-sunken: #17181c;
-  --line: #34383f;
-  --line-soft: #2c2f35;
-  --text: #e6e8ec;
-  --text-dim: #9aa0aa;
-  --text-mute: #6f7681;
-  --accent: #4c8dff;
-  --accent-dim: #2f5da8;
-  --danger: #e5534b;
+  /* —— 表面层次（由暗到亮）—— */
+  --bg: #111317; /* 最底层：窗口背景 */
+  --bg-panel: #1c1f24; /* 面板卡片、悬浮卡片 */
+  --bg-panel-2: #2d323a; /* 按钮、选中的分段（比面板亮） */
+  --bg-sunken: #101216; /* 输入框、分段轨道（比面板暗） */
+  --stage: #15181d; /* 文档背后的工作台 */
+
+  /* —— 分隔与描边 —— */
+  --line: #2a2f37; /* 区域之间的细分隔线、卡片边框 */
+  --line-soft: #24282f; /* 更弱的内部线 */
+  --stroke: #3b414b; /* 输入框、控件的外框 */
+
+  /* —— 文字层次 —— */
+  --text: #e8ebf0; /* 正文 */
+  --text-dim: #a3abb7; /* 次要标签 */
+  --text-mute: #6f7784; /* 说明、禁用态 */
+
+  /* —— 状态色（蓝只用于状态，不做装饰）—— */
+  --accent: #a8caff; /* 选择、焦点、进度 */
+  --accent-ink: #7ba3e0; /* 淡蓝在浅底上的可读版本 */
+  --primary: #3a6fdb; /* 每屏唯一主动作按钮 */
+  --primary-hover: #4a7fe9;
+  --selected: #243857; /* 选中的行 / 工具背景 */
+  --row-hover: #252930; /* 列表行悬停 */
+  --danger: #f07178;
+  --success: #6fd49a;
+  --warning: #e9c46a;
+
+  /* 兼容旧名：早期样式大量引用 --accent-dim 作为「选中底色」 */
+  --accent-dim: #243857;
   --checker-a: #2a2c31;
   --checker-b: #232529;
-  --row-h: 34px;
-  --font: 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', system-ui, sans-serif;
+
+  /* —— 字号（整数，避免离开 hinting 网格）—— */
+  --fs-caption: 12px; /* 说明、输入框上的标签、状态栏 */
+  --fs-body: 13px; /* 正文、按钮、菜单、标签页 */
+  --fs-heading: 14px; /* 属性面板里的对象名 */
+  --fs-title: 18px; /* 对话框、起始页标题 */
+
+  /* —— 尺寸 —— */
+  --h-control: 30px; /* 常规按钮、输入框 */
+  --h-compact: 28px; /* 选项栏、密集行 */
+  --h-layer: 40px; /* 图层行 */
+  --h-action: 34px; /* 属性面板的动作行（下限） */
+  --row-h: 34px; /* 兼容旧名 */
+
+  /* —— 圆角与间距 —— */
+  --r-card: 10px;
+  --r-control: 6px;
+  --r-chip: 4px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+
+  --font: 'Microsoft YaHei UI', 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', system-ui, sans-serif;
+  --font-mono: 'Cascadia Mono', 'Consolas', 'Courier New', monospace;
 }
 
 * {
@@ -223,15 +272,28 @@ body {
   position: absolute;
   margin: 0;
   padding: 0;
-  border: 1px dashed var(--accent);
-  background: rgba(0, 0, 0, 0.22);
-  outline: none;
+  /* 用 outline 而不是 border：box-sizing 是 border-box，border 会把内容区
+     往里挤 1px，导致输入框里的字与画布上渲染出来的字对不齐 */
+  border: none;
+  outline: 1px dashed var(--accent);
+  /* 不要背景：编辑器只提供光标和虚线轮廓就够了。
+     否则输入时那块底色会与最终渲染出来的文字对不上。 */
+  background: transparent;
   resize: none;
   overflow: hidden;
-  white-space: pre-wrap;
-  word-break: break-word;
+  /* 编辑期间不换行：画布上的文字也按单行渲染，换行会让光标与文字对不上 */
+  white-space: pre;
   z-index: 5;
   caret-color: var(--accent);
+  /* 让 textarea 里的字不可见：用户看到的是画布上实时渲染的文字，
+     编辑器只负责接收输入、显示光标。否则两套字体度量有微小差异，
+     叠在一起就成了「重影 / 被拉长」的样子。 */
+  color: transparent;
+}
+
+/* 选中文字用主题蓝，避免出现一大块浅色底 */
+.text-editor::selection {
+  background: rgba(76, 141, 255, 0.45);
 }
 
 /* —— 右侧面板 —— */
@@ -620,13 +682,15 @@ body {
 }
 
 .btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
+  /* 主按钮：每屏唯一的主动作用 --primary 深蓝；
+     --accent 的淡蓝只留给选择/焦点/进度这类状态显示 */
+  background: var(--primary);
+  border-color: var(--primary);
   color: #fff;
 }
 
 .btn.primary:hover {
-  background: #5b98ff;
+  background: var(--primary-hover);
 }
 
 .btn.danger {
@@ -691,6 +755,24 @@ body {
   white-space: pre-wrap;
 }
 
+/* 诊断信息：等宽、可选中，方便复制粘贴 */
+.diag {
+  margin: 0;
+  max-height: 46vh;
+  overflow: auto;
+  padding: 8px 10px;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-dim);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  user-select: text;
+}
+
 .toast {
   position: fixed;
   left: 50%;
@@ -704,4 +786,336 @@ body {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
   z-index: 50;
   pointer-events: none;
+}
+
+/* —— 自绘字体选择器 ——
+ * 按钮与每个列表项都用各自的字体渲染。原生 <select> 做不到这点：
+ * Windows 上它的绘制由系统接管，给 select / option 设 font-family 都不生效。 */
+.font-picker {
+  position: relative;
+  display: inline-block;
+}
+
+.font-picker-btn {
+  min-width: 200px;
+  max-width: 300px;
+  height: var(--h-control);
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-size: var(--fs-body);
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.font-picker-btn:hover {
+  border-color: var(--accent);
+}
+
+.font-picker-panel {
+  position: fixed;
+  z-index: 40;
+  top: calc(100% + 4px);
+  left: 0;
+  width: 340px;
+  padding: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--bg-panel);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 45%);
+}
+
+.font-picker-panel[hidden] {
+  display: none !important;
+}
+
+.font-picker-search {
+  width: 100%;
+  height: var(--h-compact);
+  margin-bottom: var(--sp-2);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-size: var(--fs-body);
+}
+
+.font-picker-search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.font-picker-list {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.font-picker-row {
+  display: block;
+  width: 100%;
+  height: 30px;
+  padding: 0 var(--sp-2);
+  border: none;
+  border-radius: var(--r-chip);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--fs-body);
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.font-picker-row:hover,
+.font-picker-row:focus {
+  outline: none;
+  background: var(--row-hover);
+}
+
+.font-picker-row.current {
+  background: var(--selected);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.font-picker-more {
+  padding: var(--sp-2);
+  color: var(--text-mute);
+  font-size: var(--fs-caption);
+}
+
+/* —— 数字 / 文本输入的统一外观 ——
+ * 浏览器默认给 number 输入加了高度不一的上下箭头，聚焦时还用系统描边
+ * （浅色系统主题下是橙黄色），和深色界面完全不搭。这里统一到设计令牌。
+ * 注意：不要靠 .prop-row / .field 限制作用域 —— 选项栏里的输入框不在其中，
+ * 之前正是因为只写了那两处，选项栏才一直是「原始」外观。 */
+input[type='number'],
+input[type='text'] {
+  height: var(--h-control);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-body);
+}
+
+input[type='number']:focus,
+input[type='text']:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 去掉 number 的原生上下箭头：它的样式无法自定义，留着就一定是系统灰。
+ * 数值仍可用键盘上下键与滚轮调整。 */
+input[type='number'] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+/* —— 滚动条 ——
+ * 默认滚动条是浅色主题的粗白条，还带上下三角按钮，在深色界面里非常突兀。 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 5px;
+  background: #39404a;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4a525e;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 去掉上下三角按钮 */
+::-webkit-scrollbar-button {
+  display: none;
+}
+
+/* —— 范围滑块 ——
+ * 不用 accent-color：那只是让控件套用系统外观（粗轨道 + 大圆块），风格无法统一。
+ * 这里用 appearance: none 完全接管轨道与滑块。 */
+input[type='range'] {
+  appearance: none;
+  width: 100%;
+  height: 18px;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-sunken);
+  box-shadow: inset 0 0 0 1px var(--stroke);
+}
+
+input[type='range']::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+input[type='range']:focus {
+  outline: none;
+}
+
+input[type='range']:focus::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--selected);
+}
+
+/* —— 颜色选择器 ——
+ * 原生控件自带一圈白色粗边框和内边距，和深色界面完全不搭。 */
+input[type='color'] {
+  width: 46px;
+  height: var(--h-control);
+  padding: 0;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  cursor: pointer;
+}
+
+input[type='color']:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+input[type='color']::-webkit-color-swatch-wrapper {
+  padding: 3px;
+}
+
+input[type='color']::-webkit-color-swatch {
+  border: none;
+  border-radius: 3px;
+}
+
+/* —— 自绘颜色选择器 ——
+ * 原生 <input type="color"> 的取色面板由系统绘制，会弹出一个浅色窗口，
+ * 与深色界面风格割裂，因此自己画：饱和度/明度方块 + 色相条 + 十六进制输入。 */
+.color-picker {
+  position: relative;
+  display: inline-block;
+}
+
+.color-picker-swatch {
+  width: 46px;
+  height: var(--h-control);
+  padding: 3px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  /* 让 paint() 写入的纯色只填内容区，留下 3px 内衬，色块不会顶到边框 */
+  background-clip: content-box;
+  cursor: pointer;
+}
+
+.color-picker-swatch:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.color-picker-panel {
+  position: fixed;
+  z-index: 41;
+  width: 184px;
+  padding: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--bg-panel);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 45%);
+}
+
+.color-picker-panel[hidden] {
+  display: none !important;
+}
+
+.color-picker-sv {
+  display: block;
+  width: 168px;
+  height: 120px;
+  border-radius: var(--r-chip);
+  cursor: crosshair;
+}
+
+.color-picker-hue {
+  position: relative;
+  height: 12px;
+  margin-top: var(--sp-2);
+  border-radius: 6px;
+  background: linear-gradient(90deg, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);
+  cursor: pointer;
+}
+
+.color-picker-hue-knob {
+  position: absolute;
+  top: -2px;
+  width: 4px;
+  height: 16px;
+  margin-left: -2px;
+  border: 1px solid #fff;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 50%);
+}
+
+.color-picker-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+
+.color-picker-preview {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-chip);
+}
+
+.color-picker-hex {
+  flex: 1;
+  min-width: 0;
+  height: var(--h-compact);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+}
+
+.color-picker-hex:focus {
+  outline: none;
+  border-color: var(--accent);
 }

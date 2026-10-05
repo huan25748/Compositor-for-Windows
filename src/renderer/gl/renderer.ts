@@ -13,6 +13,7 @@
 import {
   ADJUST_FS,
   ALPHA_FS,
+  DILATE_FS,
   BLIT_FS,
   BLEND_CODES,
   BLUR_FS,
@@ -26,6 +27,7 @@ import {
   RECT_VS,
   RECT_STROKE_FS,
   SELECTION_FS,
+  TRANSFORM_FS,
   ADJUST_CODES,
 } from './shaders.ts'
 import type { BlendMode, LayerRecord, Manifest, Transform } from '../../shared/types.ts'
@@ -88,6 +90,8 @@ export interface RenderInput {
   guides?: { axis: 'horizontal' | 'vertical'; position: number }[]
   /** 正在拖拽的参考线下标（高亮显示）。 */
   activeGuide?: number
+  /** 要显示变换框的图层矩形（文档坐标）。 */
+  transformRect?: [number, number, number, number] | null
 }
 
 // —— 3×3 矩阵工具（列主序，与 GLSL mat3 一致）——
@@ -266,9 +270,11 @@ export class Compositor {
   private rectStrokeProgram: Program
   private blurProgram: Program
   private alphaProgram: Program
+  private dilateProgram: Program
   private effectsProgram: Program
   private padCopyProgram: Program
   private gridProgram: Program
+  private transformProgram: Program
 
   private vao: WebGLVertexArrayObject
   private pool!: FboPool
@@ -276,7 +282,13 @@ export class Compositor {
   private docH = 0
 
   /** layerId -> 纹理 */
-  private layerTextures = new Map<string, { tex: WebGLTexture; version: number }>()
+  // canvas 也一并记住：文字图层重绘时可能换成**新的** canvas 对象，
+  // 而新对象的 version 会从头计数，仅比较 version 会漏掉这次更新
+  // （表现就是「改了没反应 / 打上字没有显示」）。
+  private layerTextures = new Map<
+    string,
+    { tex: WebGLTexture; version: number; canvas: LayerPixels['canvas'] | null }
+  >()
   /** 图层效果渲染结果的缓存；key 里含像素版本与效果参数。 */
   private effectCache = new Map<string, EffectRender>()
   private curveLUT: WebGLTexture | null = null
@@ -308,9 +320,11 @@ export class Compositor {
     this.rectStrokeProgram = link(gl, RECT_VS, RECT_STROKE_FS)
     this.blurProgram = link(gl, QUAD_VS, BLUR_FS)
     this.alphaProgram = link(gl, QUAD_VS, ALPHA_FS)
+    this.dilateProgram = link(gl, QUAD_VS, DILATE_FS)
     this.effectsProgram = link(gl, QUAD_VS, EFFECTS_FS)
     this.padCopyProgram = link(gl, QUAD_VS, PAD_COPY_FS)
     this.gridProgram = link(gl, RECT_VS, GRID_FS)
+    this.transformProgram = link(gl, RECT_VS, TRANSFORM_FS)
 
     const vao = gl.createVertexArray()
     if (!vao) throw new Error('无法创建 VAO')
@@ -369,10 +383,10 @@ export class Compositor {
     if (!entry) {
       const tex = gl.createTexture()
       if (!tex) throw new Error('无法创建图层纹理')
-      entry = { tex, version: -1 }
+      entry = { tex, version: -1, canvas: null }
       this.layerTextures.set(layer.id, entry)
     }
-    if (entry.version !== pixels.version) {
+    if (entry.version !== pixels.version || entry.canvas !== pixels.canvas) {
       gl.bindTexture(gl.TEXTURE_2D, entry.tex)
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, pixels.canvas)
       const filter = isLinear(layer.transform) ? gl.LINEAR : gl.NEAREST
@@ -381,6 +395,7 @@ export class Compositor {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
       entry.version = pixels.version
+      entry.canvas = pixels.canvas
     }
     return entry.tex
   }
@@ -392,10 +407,10 @@ export class Compositor {
     if (!entry) {
       const tex = gl.createTexture()
       if (!tex) throw new Error('无法创建纹理')
-      entry = { tex, version: -1 }
+      entry = { tex, version: -1, canvas: null }
       this.layerTextures.set(id, entry)
     }
-    if (entry.version !== pixels.version) {
+    if (entry.version !== pixels.version || entry.canvas !== pixels.canvas) {
       gl.bindTexture(gl.TEXTURE_2D, entry.tex)
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, pixels.canvas)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
@@ -403,6 +418,7 @@ export class Compositor {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
       entry.version = pixels.version
+      entry.canvas = pixels.canvas
     }
     return entry.tex
   }
@@ -437,6 +453,41 @@ export class Compositor {
   }
 
   /** 对 alpha 做一次可分离高斯模糊，返回结果纹理（中间产物记入 sink 以便释放）。 */
+  /**
+   * 形态学膨胀：取 ±radius 内的最大 alpha，分离式（先水平再垂直）。
+   * 描边用它而不是模糊 —— 模糊会把边缘摊成渐变（发虚），膨胀得到的是实色外扩。
+   */
+  private dilateAlphaInto(
+    srcTex: WebGLTexture,
+    w: number,
+    h: number,
+    radius: number,
+    sink: EffectSink,
+  ): WebGLTexture {
+    const gl = this.gl
+    const r = Math.max(0, radius)
+    if (r <= 0) return srcTex
+    const a = this.makeTarget(w, h)
+    const b = this.makeTarget(w, h)
+    sink.textures.push(a.tex, b.tex)
+    sink.fbos.push(a.fbo, b.fbo)
+
+    gl.useProgram(this.dilateProgram.program)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, srcTex)
+    gl.uniform1i(this.dilateProgram.uniforms['uSrc']!, 0)
+    gl.uniform1f(this.dilateProgram.uniforms['uRadius']!, r)
+    gl.uniform2f(this.dilateProgram.uniforms['uStep']!, 1 / w, 0)
+    this.drawFullQuad(w, h, a.fbo)
+
+    gl.bindTexture(gl.TEXTURE_2D, a.tex)
+    gl.uniform2f(this.dilateProgram.uniforms['uStep']!, 0, 1 / h)
+    this.drawFullQuad(w, h, b.fbo)
+
+    gl.bindVertexArray(null)
+    return b.tex
+  }
+
   private blurAlphaInto(
     srcTex: WebGLTexture,
     w: number,
@@ -533,7 +584,11 @@ export class Compositor {
     const glowBlur = on(fx.outerGlow) ? this.blurAlphaInto(alpha.tex, W, H, fx.outerGlow!.size ?? 0, sink) : alpha.tex
     const innerShadowBlur = on(fx.innerShadow) ? this.blurAlphaInto(alpha.tex, W, H, fx.innerShadow!.blur, sink) : alpha.tex
     const innerGlowBlur = on(fx.innerGlow) ? this.blurAlphaInto(alpha.tex, W, H, fx.innerGlow!.size ?? 0, sink) : alpha.tex
-    const strokeBlur = on(fx.stroke) ? this.blurAlphaInto(alpha.tex, W, H, fx.stroke!.size * 2, sink) : alpha.tex
+    // 描边用形态学膨胀（实色外扩），而不是模糊 + 阈值（发散、发虚）。
+    // 膨胀半径就等于外侧描边的宽度。
+    const strokeBlur = on(fx.stroke)
+      ? this.dilateAlphaInto(alpha.tex, W, H, fx.stroke!.size, sink)
+      : alpha.tex
 
     // 3) 合成
     const out = this.makeTarget(W, H)
@@ -658,6 +713,7 @@ export class Compositor {
       this.selectionProgram,
       this.rectStrokeProgram,
       this.gridProgram,
+      this.transformProgram,
     ]) {
       gl.deleteProgram(p.program)
     }
@@ -772,6 +828,25 @@ export class Compositor {
       gl.uniform1f(p.uniforms['uDashPeriod']!, 5)
       gl.uniform3f(p.uniforms['uColorA']!, 1, 1, 1)
       gl.uniform3f(p.uniforms['uColorB']!, 0.08, 0.08, 0.08)
+      gl.uniform2f(p.uniforms['uCanvasSize']!, this.canvas.width, this.canvas.height)
+      gl.drawArrays(gl.TRIANGLES, 0, 6)
+    }
+
+    // 变换框与四角手柄（移动工具下可拖动调整大小）
+    if (input.transformRect) {
+      const [tx, ty, tw, th] = input.transformRect
+      const dpr = this.canvas.width / this.canvas.clientWidth || 1
+      const z = input.view.zoom * dpr
+      const p = this.transformProgram
+      gl.useProgram(p.program)
+      gl.uniform4f(
+        p.uniforms['uRect']!,
+        docRect[0]! + tx * z,
+        docRect[1]! + ty * z,
+        tw * z,
+        th * z,
+      )
+      gl.uniform1f(p.uniforms['uHandle']!, 10 * dpr)
       gl.uniform2f(p.uniforms['uCanvasSize']!, this.canvas.width, this.canvas.height)
       gl.drawArrays(gl.TRIANGLES, 0, 6)
     }
@@ -1134,14 +1209,9 @@ export class Compositor {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     this.pool.release(fbo)
 
-    // framebuffer 自下而上，翻成自上而下
-    const out = new Uint8ClampedArray(w * h * 4)
-    const stride = w * 4
-    for (let y = 0; y < h; y++) {
-      const src = (h - 1 - y) * stride
-      out.set(raw.subarray(src, src + stride), y * stride)
-    }
-    return new ImageData(out, w, h)
+    // 合成结果里纹理 v=0 就是文档顶部（与显示路径一致），而 readPixels 的第一行
+    // 正是 texel 行 0，所以这里**不能再翻转**，否则导出与吸管会上下颠倒。
+    return new ImageData(new Uint8ClampedArray(raw), w, h)
   }
 }
 

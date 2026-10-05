@@ -9,12 +9,14 @@ export const ICONS = {
   wand: wrap('<path d="M4 20l10-10"/><path d="M14 6l4 4"/><path d="M18 3l1 3 3 1-3 1-1 3-1-3-3-1 3-1z"/>'),
   brush: wrap('<path d="M15 4l5 5-8 8-5-5z"/><path d="M7 12l-3 7 7-3"/>'),
   eraser: wrap('<path d="M4 15l7-7 6 6-4 4H7z"/><path d="M4 20h16"/>'),
-  gradient: wrap('<rect x="3" y="4" width="18" height="16"/><path d="M3 4h18v8H3z" fill="currentColor" opacity=".35"/>'),
   eyedropper: wrap('<path d="M15 4l5 5-9 9-4 1 1-4z"/><path d="M13 6l5 5"/>'),
   crop: wrap('<path d="M6 2v16h16"/><path d="M2 6h16v16"/>'),
   hand: wrap('<path d="M8 13V5a1.5 1.5 0 0 1 3 0v6"/><path d="M11 11V4a1.5 1.5 0 0 1 3 0v7"/><path d="M14 11V6a1.5 1.5 0 0 1 3 0v8a6 6 0 0 1-6 6H9a5 5 0 0 1-4-2l-3-4a1.5 1.5 0 0 1 2.4-1.8L7 15"/>'),
   zoom: wrap('<circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/>'),
   text: wrap('<path d="M5 5h14"/><path d="M12 5v14"/><path d="M9 19h6"/>'),
+  // 图层效果：一个图层方块 + 右上角的闪光，表示「给这个图层加效果」。
+  // 与 adjust（调整图层）区分开，不再共用同一个图标。
+  effects: wrap('<rect x="3" y="6" width="12" height="12" rx="1"/><path d="M18.5 2.5l1.1 2.6 2.6 1.1-2.6 1.1-1.1 2.6-1.1-2.6-2.6-1.1 2.6-1.1z"/>'),
   shape: wrap('<rect x="3" y="3" width="9" height="9" rx="2"/><circle cx="16.5" cy="16.5" r="4.5"/>'),
   clone: wrap('<path d="M7 4h10v4H7z"/><path d="M5 8h14l-1.5 12h-11z"/>'),
   heal: wrap('<path d="M12 3l9 9-9 9-9-9z"/><path d="M12 9v6M9 12h6"/>'),

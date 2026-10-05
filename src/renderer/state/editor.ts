@@ -47,6 +47,21 @@ export interface PixelSnapshot {
   data: Uint8ClampedArray
 }
 
+/**
+ * 全局单调递增的像素版本号。
+ *
+ * 不能每个画布各自从 0 计数：文字图层重绘时会**换成新的 canvas 对象**，新画布又从头计数，
+ * 于是渲染器缓存里记下的旧版本号可能和它相同，被判定成「没变化」而跳过纹理上传 ——
+ * 屏幕上就停留在旧内容（表现为「打上字没显示 / 改了没反应」）。
+ * 全局单调保证任何一次改动都拿到一个从未用过的值。
+ */
+let pixelVersionSeq = 0
+
+/** 标记一份像素数据已变更（取下一个全局版本号）。 */
+export function bumpPixels(pixels: { version: number }): void {
+  pixels.version = ++pixelVersionSeq
+}
+
 export class PixelStore {
   private readonly map = new Map<string, LayerPixels>()
 
@@ -64,7 +79,7 @@ export class PixelStore {
       ctx.fillStyle = fill
       ctx.fillRect(0, 0, w, h)
     }
-    const entry: LayerPixels = { canvas, version: 0 }
+    const entry: LayerPixels = { canvas, version: ++pixelVersionSeq }
     this.map.set(id, entry)
     return entry
   }
@@ -72,14 +87,14 @@ export class PixelStore {
   createFromImageData(id: string, image: ImageData): LayerPixels {
     const entry = this.create(id, image.width, image.height)
     entry.canvas.getContext('2d')!.putImageData(image, 0, 0)
-    entry.version++
+    bumpPixels(entry)
     return entry
   }
 
   /** 标记像素已改变，触发纹理重新上传。 */
   touch(id: string): void {
     const e = this.map.get(id)
-    if (e) e.version++
+    if (e) bumpPixels(e)
   }
 
   delete(id: string): void {
@@ -132,7 +147,7 @@ export class PixelStore {
       entry.canvas
         .getContext('2d')!
         .putImageData(new ImageData(new Uint8ClampedArray(s.data), s.width, s.height), 0, 0)
-      entry.version++
+      bumpPixels(entry)
     }
   }
 
@@ -378,7 +393,7 @@ export class Editor {
       this.insertAboveActive(layer)
       const px = this.pixelStore.create(layer.id, measured.width, measured.height)
       renderText(px.canvas, meta)
-      px.version++
+      bumpPixels(px)
       this.activate(layer.id)
     })
     return layer
@@ -420,12 +435,12 @@ export class Editor {
     ) {
       const next = this.pixelStore.create(layer.id, measured.width, measured.height)
       renderText(next.canvas, layer.text)
-      next.version++
+      bumpPixels(next)
       layer.transform.size = [measured.width, measured.height]
       return
     }
     renderText(px.canvas, layer.text)
-    px.version++
+    bumpPixels(px)
   }
 
   /** 新建形状图层（像素 + 官方 shape 元数据），并立刻把形状画出来。 */
@@ -464,7 +479,7 @@ export class Editor {
       this.insertAboveActive(layer)
       const px = this.pixelStore.create(layer.id, w, h)
       renderShape(px.canvas, layer.shape!)
-      px.version++
+      bumpPixels(px)
       this.activate(layer.id)
     })
     return layer
@@ -493,11 +508,11 @@ export class Editor {
     if (!px || px.canvas.width !== w || px.canvas.height !== h) {
       const next = this.pixelStore.create(layer.id, w, h)
       renderShape(next.canvas, layer.shape)
-      next.version++
+      bumpPixels(next)
       return
     }
     renderShape(px.canvas, layer.shape)
-    px.version++
+    bumpPixels(px)
   }
 
   addGroup(name = '组'): LayerRecord {
@@ -563,19 +578,20 @@ export class Editor {
       for (const id of ids) {
         const src = this.find(id)
         if (!src) continue
-        const copy = this.deepCopyLayer(src)
-        this.manifest.layers.splice(this.indexOf(src.id) + 1, 0, copy)
+        const copy = this.copyLayerDeep(src, this.indexOf(src.id))
         copies.push(copy.id)
       }
       if (copies.length) this.activate(copies[copies.length - 1]!)
     })
   }
 
-  /** 拷贝图层（含像素、蒙版与组内后代）。 */
-  private deepCopyLayer(src: LayerRecord, parentOverride?: string): LayerRecord {
+  /** 复制单个图层（含像素与蒙版，不含后代）。 */
+  private copyLayerShallow(src: LayerRecord, parentOverride?: string): LayerRecord {
     const copy: LayerRecord = clone(src)
     copy.id = newID()
     if (parentOverride) copy.parentID = parentOverride
+    else delete copy.parentID
+
     if (copy.imageFile) {
       copy.imageFile = `${copy.id}.png`
       const px = this.pixelStore.get(src.id)
@@ -595,8 +611,24 @@ export class Editor {
         )
       }
     }
+    return copy
+  }
+
+  /**
+   * 连同后代一起复制并插入到 insertAfter 之后，返回根副本。
+   *
+   * 之前这里递归复制了子图层却没有把它们插进 manifest，导致复制一个组会把
+   * 组里的内容整片丢掉。现在每复制一层就落一次盘，并把游标推进到该副本之后。
+   */
+  private copyLayerDeep(src: LayerRecord, insertAfter: number, parentOverride?: string): LayerRecord {
+    const copy = this.copyLayerShallow(src, parentOverride)
+    this.manifest.layers.splice(insertAfter + 1, 0, copy)
     if (src.isGroup) {
-      for (const child of this.childrenOf(src.id)) this.deepCopyLayer(child, copy.id)
+      let cursor = insertAfter + 1
+      for (const child of this.childrenOf(src.id)) {
+        const childCopy = this.copyLayerDeep(child, cursor, copy.id)
+        cursor = this.indexOf(childCopy.id)
+      }
     }
     return copy
   }
@@ -741,10 +773,23 @@ export class Editor {
   setTransform(id: string, t: Partial<Transform>): void {
     const layer = this.find(id)
     if (!layer) return
+    const before = { ...layer.transform, origin: [...layer.transform.origin] as [number, number], size: [...layer.transform.size] as [number, number] }
     this.edit('变换图层', () => {
       layer.transform = { ...layer.transform, ...t }
       // 形状图层按新尺寸重画，而不是把位图拉伸变形
       if (layer.shape && (t.size || t.origin)) this.rerenderShape(layer)
+      // 文字图层同理：按缩放比例调字号后重绘，避免字被拉糊
+      if (layer.text && t.size && before.size[0] > 0 && before.size[1] > 0) {
+        const rx = t.size[0] / before.size[0]
+        const ry = t.size[1] / before.size[1]
+        const ratio = (rx + ry) / 2
+        if (Math.abs(ratio - 1) > 1e-6) {
+          layer.text.fontSize = Math.max(1, layer.text.fontSize * ratio)
+          layer.text.tracking = layer.text.tracking * ratio
+          layer.text.lineSpacing = layer.text.lineSpacing * ratio
+          this.rerenderText(layer)
+        }
+      }
     })
   }
 
@@ -767,7 +812,7 @@ export class Editor {
       const ctx = entry.canvas.getContext('2d')!
       ctx.fillStyle = reveal ? '#ffffff' : '#000000'
       ctx.fillRect(0, 0, 1, 1)
-      entry.version++
+      bumpPixels(entry)
     })
   }
 

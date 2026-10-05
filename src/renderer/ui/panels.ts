@@ -1,6 +1,7 @@
 /** 右侧面板：图层列表、属性、调整参数，以及相关对话框。 */
 import { clear, el, field, hexToRgb01, modal, numberInput, rgb01ToHex, slider, toast } from './dom.ts'
 import { ICONS } from './icons.ts'
+import { colorPicker } from './colorpicker.ts'
 import { Editor, type PixelStore } from '../state/editor.ts'
 import {
   BLEND_MODES,
@@ -17,7 +18,7 @@ export interface LayerPanelCallbacks {
   onRename(id: string, name: string): void
   onToggleMask(id: string): void
   onDrop(id: string, targetId: string | null, position: 'above' | 'below' | 'inside'): void
-  onAction(action: 'new' | 'newGroup' | 'newAdjust' | 'duplicate' | 'delete' | 'mask' | 'clip' | 'up' | 'down'): void
+  onAction(action: 'new' | 'newGroup' | 'newAdjust' | 'effects' | 'duplicate' | 'delete' | 'mask' | 'clip' | 'up' | 'down'): void
 }
 
 const ZERO = '0px'
@@ -75,6 +76,8 @@ export class LayersPanel {
       btn('plus', '新建图层', 'new'),
       btn('folder', '新建组', 'newGroup'),
       btn('adjust', '新建调整图层…', 'newAdjust'),
+      // 图层效果入口放在这里（原在右侧属性面板）。多个效果可叠加，见 openEffectsDialog。
+      btn('effects', '图层效果（描边、投影等）…', 'effects'),
       btn('copy', '复制图层', 'duplicate'),
       btn('masks', '添加蒙版（显示全部）', 'mask'),
       btn('clip', '创建/取消剪贴蒙版', 'clip'),
@@ -603,10 +606,19 @@ export function openEffectsDialog(editor: Editor, layer: LayerRecord, onChanged:
 
     if ('color' in values) {
       const rgb = (values['color'] as [number, number, number]) ?? [0, 0, 0]
-      const color = el('input', { type: 'color', value: rgb01ToHex(rgb[0], rgb[1], rgb[2]) })
-      color.disabled = !enabled
-      color.addEventListener('input', () => setKey('color', hexToRgb01(color.value)))
-      body.push(el('div', { class: 'prop-row' }, [el('label', { text: `　${spec.label}颜色` }), color]))
+      // 自绘取色器：原生颜色控件的弹窗由系统绘制，风格无法统一
+      const picker = colorPicker({
+        value: rgb01ToHex(rgb[0], rgb[1], rgb[2]),
+        onChange: (hex) => setKey('color', hexToRgb01(hex)),
+      })
+      if (!enabled) {
+        // 效果未启用时不允许改颜色（原来用 input.disabled 实现）
+        picker.root.style.pointerEvents = 'none'
+        picker.root.style.opacity = '0.5'
+      }
+      body.push(
+        el('div', { class: 'prop-row' }, [el('label', { text: `　${spec.label}颜色` }), picker.root]),
+      )
     }
 
     for (const n of spec.numeric) {

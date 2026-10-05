@@ -1,7 +1,7 @@
 {
   "name": "compositor-win",
   "productName": "Compositor",
-  "version": "1.1.0",
+  "version": "1.1.9",
   "description": "Compositor for Windows — 免费开源的图层合成器（简体中文版）",
   "license": "MIT",
   "author": "Compositor for Windows",
@@ -16,6 +16,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "ag-psd": "^31.0.2",
     "electron": "^44.5.1",
     "electron-builder": "^26.15.3",
     "esbuild": "^0.25.10",

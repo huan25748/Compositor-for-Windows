@@ -3,13 +3,16 @@
  * 画布上的全部工具交互、菜单命令、文件读写都在这里收口。
  */
 import { Compositor, type ViewTransform } from './gl/renderer.ts'
-import { Editor, type TextStyle } from './state/editor.ts'
-import { FONT_CHOICES } from './text.ts'
+import { Editor, bumpPixels, type TextStyle } from './state/editor.ts'
+import { FONT_CHOICES, fontLabel, sortFonts } from './text.ts'
+import { fontPicker, type FontPickerHandle } from './ui/fontpicker.ts'
+import { colorPicker } from './ui/colorpicker.ts'
+import { exportPsd, importPsd } from './psd.ts'
 import { SHAPE_KINDS, type ShapeKind } from './shape.ts'
 import { cloneAt, healAt, liquifyAt, smudgeAt } from './retouch.ts'
 import { clear, el, field, hexToRgb01, modal, need, numberInput, rgb01ToHex, toast } from './ui/dom.ts'
 import { ICONS } from './ui/icons.ts'
-import { LayersPanel, PropsPanel, openAdjustmentDialog } from './ui/panels.ts'
+import { LayersPanel, PropsPanel, openAdjustmentDialog, openEffectsDialog } from './ui/panels.ts'
 import { TOOLS, TOOL_BY_ID, type ToolID } from './ui/tools.ts'
 import { createDocument, createPixelLayer } from '../shared/factory.ts'
 import { CompFormatError } from '../shared/manifest.ts'
@@ -27,8 +30,9 @@ interface CompositorBridge {
   pickSavePath(suggested: string): Promise<string | null>
   writeProject(p: ProjectPayload): Promise<{ dir: string }>
   pickImages(): Promise<{ name: string; bytes: Uint8Array }[]>
-  saveImage(o: { suggested: string; format: 'png' | 'jpeg'; bytes: Uint8Array }): Promise<string | null>
+  saveImage(o: { suggested: string; format: 'png' | 'jpeg' | 'psd'; bytes: Uint8Array }): Promise<string | null>
   reveal(path: string): Promise<void>
+  listFonts(): Promise<string[]>
   info(): Promise<{ version: string; electron: string; chrome: string }>
   onMenuCommand(h: (c: string) => void): void
 }
@@ -46,10 +50,18 @@ type DragMode =
   | { kind: 'marquee'; startX: number; startY: number; x: number; y: number; additive: boolean }
   | { kind: 'lasso'; points: [number, number][] }
   | { kind: 'brush'; id: string; lastX: number; lastY: number }
-  | { kind: 'gradient'; startX: number; startY: number; x: number; y: number }
   | { kind: 'crop'; startX: number; startY: number; x: number; y: number }
   | { kind: 'shape'; startX: number; startY: number; x: number; y: number }
   | { kind: 'retouch'; id: string; lastX: number; lastY: number }
+  | {
+      kind: 'scale'
+      id: string
+      handle: 'nw' | 'ne' | 'sw' | 'se'
+      startX: number
+      startY: number
+      origin: [number, number]
+      size: [number, number]
+    }
 
 /** 需要逐笔改写像素的修图工具。 */
 type RetouchTool = 'clone' | 'heal' | 'smudge' | 'liquify'
@@ -77,8 +89,15 @@ class App {
     alignment: 'left' as 'left' | 'center' | 'right',
     tracking: 0,
     lineSpacing: 8,
+    /** 描边：沿字形外缘向外扩一层实色。0 表示不描边。 */
+    strokeWidth: 0,
+    strokeColor: '#000000',
   }
   wandTolerance = 32
+  /** 系统已安装字体（异步载入后替换内置的精简列表）。 */
+  private systemFonts: string[] = []
+  /** 文字工具当前那个字体选择器（用于就地更新，避免重建选项栏）。 */
+  private fontPickerHandle: FontPickerHandle | null = null
   /** 形状工具的当前样式。 */
   shapeStyle = {
     kind: 'rectangle' as ShapeKind,
@@ -120,6 +139,11 @@ class App {
   private spaceDown = false
   private needsRender = true
   private lastStatus = ''
+  /** 最近的操作日志（诊断用，最多保留 200 条）。 */
+  private opLog: string[] = []
+  /** 内部剪贴板：保存图层像素与它的**完整变换**（有选区时只保留选区内）。 */
+  private clipboard: ImageData | null = null
+  private clipboardTransform: LayerRecord['transform'] | null = null
   /** 标尺的两个 canvas。 */
   private rulerTop: HTMLCanvasElement | null = null
   private rulerLeft: HTMLCanvasElement | null = null
@@ -149,6 +173,7 @@ class App {
       {
         onSelect: (id, additive) => {
           this.editor.select(id, additive)
+          this.logOp(`选中图层 → ${this.describe(this.editor.find(id))}`)
           // 选中不同图层时，选项栏要反映该图层的文字样式
           if (this.tool === 'text') this.buildOptionsBar()
         },
@@ -167,6 +192,7 @@ class App {
     this.installKeyboard()
     this.installDropTarget()
     this.buildRulers()
+    void this.loadSystemFonts()
     window.compositor.onMenuCommand((cmd) => void this.handleCommand(cmd))
 
     this.editor.loadDocument(createDocument(1280, 800), null)
@@ -225,6 +251,7 @@ class App {
         showPixelGrid: this.showPixelGrid,
         gridSpacing: this.gridSpacing,
         ...this.guidePayload(doc),
+        transformRect: this.transformRectOf(),
       })
     } catch (err) {
       console.error(err)
@@ -275,7 +302,10 @@ class App {
       need('statusTool').textContent = toolName
     }
     need('statusZoom').textContent = `${Math.round(this.view.zoom * 100)}%`
-    need('statusDoc').textContent = `${doc.width} × ${doc.height} · ${doc.layers.length} 图层`
+    const activeLayer = this.editor.activeLayer
+    need('statusDoc').textContent =
+      `${doc.width} × ${doc.height} · ${doc.layers.length} 图层` +
+      (activeLayer ? ` · 当前：${activeLayer.name}` : '')
     need('canvasHint').hidden = doc.layers.length > 0
   }
 
@@ -351,6 +381,13 @@ class App {
   private buildOptionsBar(): void {
     const bar = need('optionsBar')
     clear(bar)
+    // 字体/颜色选择器的面板挂在 body 上（选项栏会裁剪它们），重建时必须一并清掉，
+    // 否则每重建一次就多留一个看不见的旧面板。
+    for (const stale of document.querySelectorAll(
+      'body > .font-picker-panel, body > .color-picker-panel',
+    )) {
+      stale.remove()
+    }
     const tool = TOOL_BY_ID.get(this.tool)
     if (!tool) return
 
@@ -382,11 +419,13 @@ class App {
 
       if (tool.id === 'brush') {
         bar.append(el('span', { class: 'opt-label', text: '颜色' }))
-        const color = el('input', { type: 'color', value: this.brush.color })
-        color.addEventListener('input', () => {
-          this.brush.color = color.value
+        const color = colorPicker({
+          value: this.brush.color,
+          onChange: (hex) => {
+            this.brush.color = hex
+          },
         })
-        bar.append(color)
+        bar.append(color.root)
       }
     } else if (tool.id === 'wand') {
       bar.append(el('span', { class: 'opt-label', text: '容差' }))
@@ -396,13 +435,6 @@ class App {
       })
       bar.append(tol)
       bar.append(el('span', { class: 'opt-label', text: '（对当前图层取样）' }))
-    } else if (tool.id === 'gradient') {
-      bar.append(el('span', { class: 'opt-label', text: '前景色 → 透明' }))
-      const color = el('input', { type: 'color', value: this.brush.color })
-      color.addEventListener('input', () => {
-        this.brush.color = color.value
-      })
-      bar.append(color)
     } else if (tool.id === 'marquee' || tool.id === 'lasso') {
       bar.append(el('span', { class: 'opt-label', text: '按住 Shift 追加选区' }))
       const clearBtn = el('button', { class: 'btn', text: '取消选择', onClick: () => this.clearSelection() })
@@ -412,11 +444,29 @@ class App {
     } else if (tool.id === 'text') {
       const style = this.activeTextStyle()
 
-      const font = el('select', { class: 'select' })
-      for (const f of FONT_CHOICES) font.append(el('option', { value: f.value, text: f.label }))
-      font.value = style.fontName
-      font.addEventListener('change', () => this.updateTextStyle({ fontName: font.value }))
-      bar.append(el('span', { class: 'opt-label', text: '字体' }), font)
+      // 候选字体：优先用系统字体表（已过滤掉「选了不生效」的名字），否则退回内置精简表。
+      // 当前字体不在候选里就补到最前面，避免选择器显示成别的字体。
+      const candidates =
+        this.systemFonts.length > 0 ? this.systemFonts : FONT_CHOICES.map((f) => f.value)
+      const fontOptions = candidates.includes(style.fontName)
+        ? candidates
+        : [style.fontName, ...candidates]
+      const picker = fontPicker({
+        fonts: fontOptions,
+        value: style.fontName,
+        onPick: (name) => this.updateTextStyle({ fontName: name }),
+      })
+      this.fontPickerHandle = picker
+      bar.append(el('span', { class: 'opt-label', text: '字体' }), picker.root)
+      // 装了新字体不必重启：点一下重新读一次字体注册表
+      bar.append(
+        el('button', {
+          class: 'btn',
+          text: '刷新',
+          title: '重新读取系统字体（刚装的字体点这里）',
+          onClick: () => void this.loadSystemFonts(),
+        }),
+      )
 
       const size = numberInput(style.fontSize, { min: 4, max: 800, step: 1 })
       size.addEventListener('change', () =>
@@ -424,9 +474,11 @@ class App {
       )
       bar.append(el('span', { class: 'opt-label', text: '字号' }), size)
 
-      const color = el('input', { type: 'color', value: style.color })
-      color.addEventListener('input', () => this.updateTextStyle({ color: color.value }))
-      bar.append(el('span', { class: 'opt-label', text: '颜色' }), color)
+      const color = colorPicker({
+        value: style.color,
+        onChange: (hex) => this.updateTextStyle({ color: hex }),
+      })
+      bar.append(el('span', { class: 'opt-label', text: '颜色' }), color.root)
 
       const align = el('select', { class: 'select' })
       align.append(el('option', { value: 'left', text: '左对齐' }))
@@ -449,6 +501,8 @@ class App {
         this.updateTextStyle({ lineSpacing: Number(leading.value) }),
       )
       bar.append(el('span', { class: 'opt-label', text: '行距' }), leading)
+      // 文字描边不再放在这里：描边已归图层效果统一管理（图层面板底部的「图层效果」按钮）。
+      // textStroke 字段仍保留，用于读取既有 .comp 文件里的设置。
     } else if (tool.id === 'shape') {
       const kind = el('select', { class: 'select' })
       for (const k of SHAPE_KINDS) kind.append(el('option', { value: k.value, text: k.label }))
@@ -459,12 +513,14 @@ class App {
       })
       bar.append(el('span', { class: 'opt-label', text: '形状' }), kind)
 
-      const color = el('input', { type: 'color', value: this.shapeStyle.color })
-      color.addEventListener('input', () => {
-        this.shapeStyle.color = color.value
-        this.applyShapeStyle()
+      const color = colorPicker({
+        value: this.shapeStyle.color,
+        onChange: (hex) => {
+          this.shapeStyle.color = hex
+          this.applyShapeStyle()
+        },
       })
-      bar.append(el('span', { class: 'opt-label', text: '颜色' }), color)
+      bar.append(el('span', { class: 'opt-label', text: '颜色' }), color.root)
 
       if (this.shapeStyle.kind === 'roundedRectangle') {
         const radius = numberInput(this.shapeStyle.cornerRadius, { min: 0, max: 500, step: 1 })
@@ -553,9 +609,19 @@ class App {
   }
 
   private onPointerDown(ev: PointerEvent): void {
+    // 点在文字编辑框内时，一律交给浏览器处理（定位光标、拖选文本）。
+    // 编辑框是画布的子元素，事件会冒泡到这里；若继续走下面的逻辑并
+    // preventDefault，用户就没法在文字中间点光标或选中文字。
+    if (ev.target instanceof HTMLTextAreaElement) return
+
     const host = need('canvasHost')
     host.setPointerCapture(ev.pointerId)
     const [dx, dy] = this.screenToDoc(ev.clientX, ev.clientY)
+    this.logOp(
+      `按下 工具=${this.tool} 位置=(${Math.round(dx)},${Math.round(dy)}) 当前图层=${this.describe(
+        this.editor.activeLayer,
+      )}`,
+    )
 
     // 空格 / 中键 / 抓手 = 平移
     if (this.spaceDown || ev.button === 1 || this.tool === 'hand') {
@@ -573,8 +639,33 @@ class App {
         this.pickColor(dx, dy)
         return
       case 'move': {
+        // 自动选择：**优先保持当前图层**——只有当前图层在点击处是透明的，
+        // 才往下层找。否则用户刚选中副本、一点它的透明区域就被切到下层，
+        // 拖动时移动的就是别的图层（用户感知为「方向反了」「框和图片不在一起」）。
+        if (!ev.shiftKey && !ev.ctrlKey) {
+          const current = this.editor.activeLayer
+          if (!current || !this.layerHasPixelAt(current, dx, dy)) {
+            const hit = this.layerAtDoc(dx, dy)
+            if (hit && hit.id !== this.editor.activeLayerID) this.editor.select(hit.id)
+          }
+        }
+
         const layer = this.editor.activeLayer
         if (!layer) return
+        // 先看是不是抓住了四角手柄：抓住就是缩放，否则是移动
+        const handle = this.handleAt(dx, dy, layer)
+        if (handle && !layer.isGroup && !layer.adjustment) {
+          this.drag = {
+            kind: 'scale',
+            id: layer.id,
+            handle,
+            startX: dx,
+            startY: dy,
+            origin: [...layer.transform.origin] as [number, number],
+            size: [...layer.transform.size] as [number, number],
+          }
+          return
+        }
         this.drag = {
           kind: 'move',
           id: layer.id,
@@ -610,9 +701,6 @@ class App {
         this.drag = { kind: 'brush', id: layer.id, lastX: dx, lastY: dy }
         return
       }
-      case 'gradient':
-        this.drag = { kind: 'gradient', startX: dx, startY: dy, x: dx, y: dy }
-        return
       case 'crop':
         this.drag = { kind: 'crop', startX: dx, startY: dy, x: dx, y: dy }
         return
@@ -654,14 +742,21 @@ class App {
         return
       }
       case 'text': {
+        // 必须阻止 pointerdown 的默认行为：否则浏览器会把焦点交给画布，
+        // 刚打开的编辑框立刻 blur，空图层又被「未输入就删除」的逻辑清掉 ——
+        // 表现就是「点下去没反应，也没有图层」。
+        ev.preventDefault()
         // 点在已有文字上就继续编辑它，否则新建一个文字图层
         const hit = this.textLayerAt(dx, dy)
         if (hit) {
           this.openTextEditor(hit.id)
           return
         }
-        const layer = this.editor.addTextLayer('文字', this.currentTextMeta(), [dx, dy])
-        this.openTextEditor(layer.id)
+        // 用空内容建层：画布极小、不显示任何字，避免「点一下空白就冒出一个
+        // 『文字』占位」——那正是你看到的那两个字。用户输入后才会画出真正的文字；
+        // 若一直没输入，离开编辑器时会自动删掉这一层。
+        const layer = this.editor.addTextLayer('', this.currentTextMeta(), [dx, dy])
+        this.openTextEditor(layer.id, true)
         return
       }
     }
@@ -701,10 +796,6 @@ class App {
         this.drag.lastY = dy
         return
       }
-      case 'gradient':
-        this.drag.x = dx
-        this.drag.y = dy
-        return
       case 'crop':
         this.drag.x = dx
         this.drag.y = dy
@@ -718,6 +809,44 @@ class App {
         this.retouchSegment(this.drag.id, this.drag.lastX, this.drag.lastY, dx, dy)
         this.drag.lastX = dx
         this.drag.lastY = dy
+        return
+      }
+      case 'scale': {
+        const layer = this.editor.find(this.drag.id)
+        if (!layer) return
+        const d = this.drag
+        const ddx = dx - d.startX
+        const ddy = dy - d.startY
+        let w = d.size[0]
+        let h = d.size[1]
+        let ox = d.origin[0]
+        let oy = d.origin[1]
+
+        if (d.handle.includes('e')) w = d.size[0] + ddx
+        if (d.handle.includes('s')) h = d.size[1] + ddy
+        if (d.handle.includes('w')) {
+          w = d.size[0] - ddx
+          ox = d.origin[0] + (d.size[0] - w)
+        }
+        if (d.handle.includes('n')) {
+          h = d.size[1] - ddy
+          oy = d.origin[1] + (d.size[1] - h)
+        }
+        w = Math.max(1, w)
+        h = Math.max(1, h)
+
+        // 按住 Shift 锁定原始宽高比
+        if (ev.shiftKey && d.size[0] > 0 && d.size[1] > 0) {
+          const ratio = d.size[0] / d.size[1]
+          if (w / h > ratio) w = h * ratio
+          else h = w / ratio
+          if (d.handle.includes('w')) ox = d.origin[0] + (d.size[0] - w)
+          if (d.handle.includes('n')) oy = d.origin[1] + (d.size[1] - h)
+        }
+
+        layer.transform.size = [Math.round(w), Math.round(h)]
+        layer.transform.origin = [Math.round(this.snap(ox, 'x')), Math.round(this.snap(oy, 'y'))]
+        this.invalidate()
         return
       }
       default:
@@ -749,9 +878,6 @@ class App {
       case 'lasso':
         this.commitLasso()
         break
-      case 'gradient':
-        this.commitGradient(dx, dy)
-        break
       case 'crop':
         this.commitCrop(dx, dy)
         break
@@ -762,6 +888,21 @@ class App {
         this.editor.pixelStore.touch(this.drag.id)
         this.invalidate()
         break
+      case 'scale': {
+        const layer = this.editor.find(this.drag.id)
+        if (layer) {
+          const size = [...layer.transform.size] as [number, number]
+          const origin = [...layer.transform.origin] as [number, number]
+          // 先把拖动结果撤回原值，再走一次带历史的修改
+          layer.transform.size = this.drag.size
+          layer.transform.origin = this.drag.origin
+          this.editor.setTransform(layer.id, {
+            size: [Math.round(size[0]), Math.round(size[1])],
+            origin: [Math.round(origin[0]), Math.round(origin[1])],
+          })
+        }
+        break
+      }
       case 'brush':
         this.editor.pixelStore.touch(this.drag.id)
         this.invalidate()
@@ -769,6 +910,7 @@ class App {
       default:
         break
     }
+    this.logOp(`松开 kind=${this.drag.kind} 当前图层=${this.describe(this.editor.activeLayer)}`)
     this.drag = { kind: 'none' }
     this.buildOptionsBar()
   }
@@ -900,6 +1042,96 @@ class App {
   }
 
   // —— 参考线与吸附 ——
+
+  /** 记一条操作日志（诊断用）。 */
+  private logOp(message: string): void {
+    const t = new Date()
+    const stamp =
+      `${String(t.getMinutes()).padStart(2, '0')}:${String(t.getSeconds()).padStart(2, '0')}.` +
+      `${String(t.getMilliseconds()).padStart(3, '0')}`
+    this.opLog.push(`${stamp} ${message}`)
+    if (this.opLog.length > 200) this.opLog.shift()
+  }
+
+  /** 图层的一句话摘要。 */
+  private describe(layer: LayerRecord | null | undefined): string {
+    if (!layer) return '（无）'
+    const px = this.editor.pixelStore.get(layer.id)
+    return (
+      `${layer.name} o=(${Math.round(layer.transform.origin[0])},${Math.round(layer.transform.origin[1])}) ` +
+      `s=(${Math.round(layer.transform.size[0])},${Math.round(layer.transform.size[1])}) ` +
+      `画布=${px ? `${px.canvas.width}×${px.canvas.height}` : '无'}${layer.isVisible ? '' : ' 隐藏'}`
+    )
+  }
+
+  /** 列出当前状态，反馈问题时一并提供即可精确定位。 */
+  private showDiagnostics(): void {
+    const doc = this.editor.manifest
+    const lines: string[] = []
+    lines.push(`工具：${TOOL_BY_ID.get(this.tool)?.name ?? this.tool}`)
+    lines.push(
+      `视图：缩放 ${(this.view.zoom * 100).toFixed(1)}%，平移 (${Math.round(this.view.panX)}, ${Math.round(
+        this.view.panY,
+      )})，像素比 ${window.devicePixelRatio}`,
+    )
+    lines.push(`画布：${doc.width} × ${doc.height}`)
+    lines.push(`选区：${this._selectionMask ? '有' : '无'}　参考线：${doc.guides?.length ?? 0} 条`)
+    lines.push('')
+    lines.push('图层（自下而上）：')
+    doc.layers.forEach((l, i) => {
+      const px = this.editor.pixelStore.get(l.id)
+      const flags = [
+        l.isGroup ? '组' : '',
+        l.adjustment ? '调整' : '',
+        l.text ? '文字' : '',
+        l.shape ? '形状' : '',
+        l.imageFile ? '' : '无图',
+        l.isVisible ? '' : '隐藏',
+        l.id === this.editor.activeLayerID ? '←活动' : '',
+      ]
+        .filter(Boolean)
+        .join(' ')
+      lines.push(
+        `[${i}] ${l.name}  origin=(${Math.round(l.transform.origin[0])},${Math.round(
+          l.transform.origin[1],
+        )}) size=(${Math.round(l.transform.size[0])},${Math.round(l.transform.size[1])}) ` +
+          `画布=${px ? `${px.canvas.width}×${px.canvas.height}` : '无'} ${flags}`,
+      )
+    })
+
+    lines.push('')
+    lines.push('最近操作（最多 60 条）：')
+    for (const line of this.opLog.slice(-60)) lines.push(`  ${line}`)
+
+    // 活动图层的像素采样：上/中/下各三点，用来判断是否上下颠倒
+    const active = this.editor.activeLayer
+    if (active) {
+      const px = this.editor.pixelStore.get(active.id)
+      const ctx = px?.canvas.getContext('2d')
+      if (px && ctx) {
+        const img = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+        const at = (fx: number, fy: number): string => {
+          const x = Math.min(px.canvas.width - 1, Math.floor(px.canvas.width * fx))
+          const y = Math.min(px.canvas.height - 1, Math.floor(px.canvas.height * fy))
+          const i = (y * px.canvas.width + x) * 4
+          const a = img.data[i + 3]!
+          return a === 0 ? '透明' : `${img.data[i]},${img.data[i + 1]},${img.data[i + 2]}`
+        }
+        lines.push('')
+        lines.push(`活动图层像素采样（左/中/右）：`)
+        lines.push(`  上：${at(0.2, 0.1)} | ${at(0.5, 0.1)} | ${at(0.8, 0.1)}`)
+        lines.push(`  中：${at(0.2, 0.5)} | ${at(0.5, 0.5)} | ${at(0.8, 0.5)}`)
+        lines.push(`  下：${at(0.2, 0.9)} | ${at(0.5, 0.9)} | ${at(0.8, 0.9)}`)
+      }
+    }
+
+    modal({
+      title: '诊断信息（可直接截图或复制）',
+      body: [el('pre', { class: 'diag', text: lines.join('\n') })],
+      confirmLabel: '好',
+      infoOnly: true,
+    })
+  }
 
   /** 建立/重建标尺（两个 canvas）。 */
   private buildRulers(): void {
@@ -1051,7 +1283,9 @@ class App {
     if (this.showGrid && this.gridSpacing > 0) {
       targets.push(Math.round(value / this.gridSpacing) * this.gridSpacing)
     }
-    const threshold = 6 / Math.max(this.view.zoom, 0.01)
+    // 阈值固定为屏幕 6px；再给一个文档单位上限，
+    // 否则视图缩得很小时吸附半径会大到「拖不动」的程度
+    const threshold = Math.min(6 / Math.max(this.view.zoom, 0.01), 20)
     let best = value
     let bestDist = threshold
     for (const t of targets) {
@@ -1064,11 +1298,195 @@ class App {
     return best
   }
 
+  // —— 剪贴板 ——
+
+  /** 复制或剪切当前图层的像素；有选区时只作用于选区内。 */
+  private copyLayerToClipboard(cut: boolean): void {
+    const layer = this.editor.activeLayer
+    if (!layer || layer.isGroup || layer.adjustment) {
+      toast('请先选择一个像素图层')
+      return
+    }
+    const px = this.editor.pixelStore.get(layer.id)
+    if (!px) return
+    const ctx = px.canvas.getContext('2d')
+    if (!ctx) return
+
+    const doc = this.editor.manifest
+    const mask = this._selectionMask
+    const usable = Boolean(mask && mask.length === doc.width * doc.height)
+
+    // 复制出去的内容：有选区就只保留选区内
+    const image = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+    if (usable) {
+      applySelectionMask(image, mask!, doc.width, doc.height, layer.transform, true)
+    }
+    this.clipboard = image
+    this.clipboardTransform = {
+      ...layer.transform,
+      origin: [...layer.transform.origin] as [number, number],
+      size: [...layer.transform.size] as [number, number],
+    }
+
+    if (cut) {
+      this.editor.edit(
+        usable ? '剪切选区内容' : '剪切图层内容',
+        () => {
+          if (usable) {
+            const fresh = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+            applySelectionMask(fresh, mask!, doc.width, doc.height, layer.transform, false)
+            ctx.putImageData(fresh, 0, 0)
+          } else {
+            ctx.clearRect(0, 0, px.canvas.width, px.canvas.height)
+          }
+          bumpPixels(px)
+        },
+        [layer.id],
+      )
+    }
+    toast(cut ? (usable ? '已剪切选区内内容' : '已剪切图层内容') : usable ? '已复制选区内内容' : '已复制图层')
+  }
+
+  /** 粘贴为新的图层，落回复制时的位置。 */
+  private pasteClipboard(): void {
+    const clip = this.clipboard
+    if (!clip) {
+      toast('剪贴板是空的')
+      return
+    }
+    const layer = this.editor.addImageLayer('粘贴', clip)
+    // 连尺寸/旋转/翻转一起还原，否则粘贴出来的图层会与复制时不一致
+    if (this.clipboardTransform) {
+      this.editor.setTransform(layer.id, { ...this.clipboardTransform })
+    }
+    toast('已粘贴为新图层')
+  }
+
+  /** Ctrl+J：通过拷贝新建图层；有选区时只拷贝选区内像素。 */
+  private copyToNewLayer(): void {
+    const layer = this.editor.activeLayer
+    if (!layer || layer.isGroup || layer.adjustment) {
+      toast('请先选择一个像素图层')
+      return
+    }
+    const px = this.editor.pixelStore.get(layer.id)
+    if (!px) return
+    const ctx = px.canvas.getContext('2d')
+    if (!ctx) return
+
+    const doc = this.editor.manifest
+    const mask = this._selectionMask
+    const usable = Boolean(mask && mask.length === doc.width * doc.height)
+    let image = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+    if (usable) {
+      applySelectionMask(image, mask!, doc.width, doc.height, layer.transform, true)
+    }
+
+    const sx = layer.transform.size[0] / Math.max(px.canvas.width, 1)
+    const sy = layer.transform.size[1] / Math.max(px.canvas.height, 1)
+    let origin: [number, number] = [layer.transform.origin[0], layer.transform.origin[1]]
+    let size: [number, number] = [layer.transform.size[0], layer.transform.size[1]]
+
+    if (usable) {
+      // 有选区时把副本裁成「内容本身」的大小。
+      // 否则副本的框仍是整层大小、而内容只占一角，在画布上就成了
+      // 「框在的地方没有图片」——这正是用户看到的现象。
+      const box = opaqueBounds(image)
+      if (!box) {
+        toast('选区里没有可以拷贝的内容')
+        return
+      }
+      const [bx, by, bw, bh] = box
+      image = cropImageData(image, box)
+      origin = [layer.transform.origin[0] + bx * sx, layer.transform.origin[1] + by * sy]
+      size = [bw * sx, bh * sy]
+    }
+
+    const copy = this.editor.addImageLayer(`${layer.name} 副本`, image)
+    // 必须连尺寸/旋转/翻转一起复制：addImageLayer 是按画布尺寸建层的，
+    // 只抄位置的话，缩放过的图层一复制就会缩回原始大小，与原图层错位重叠。
+    this.editor.setTransform(copy.id, {
+      origin: [Math.round(origin[0]), Math.round(origin[1])],
+      size: [Math.round(size[0]), Math.round(size[1])],
+      rotation: layer.transform.rotation,
+      flipX: layer.transform.flipX,
+      flipY: layer.transform.flipY,
+      sampling: layer.transform.sampling,
+    })
+    this.logOp(`Ctrl+J → ${this.describe(copy)}`)
+    toast(usable ? '已通过拷贝的图层（仅选区内，已裁到内容大小）' : '已通过拷贝的图层')
+  }
+
   // —— 文字工具 ——
 
+  /**
+   * 只保留浏览器真正能用的字体名。
+   *
+   * 系统报告的字体名常常是「族名 + 字重」（如 `阿里巴巴普惠体 3.0 105 Heavy`），而 CSS/Canvas
+   * 需要的是族名。名字对不上时浏览器会**静默回退**到默认字体，于是表现为「选了某个字体却没有任何
+   * 变化」。这里逐个实测：先用原名，失败就逐层剥掉尾部的字重/样式词（含纯数字字重）再试，
+   * 两者都失败才丢弃。这样列出来的每一项都是真正生效的。
+   */
+  private async filterUsableFonts(fonts: string[]): Promise<string[]> {
+    const ctx = new OffscreenCanvas(1, 1).getContext('2d')
+    if (!ctx) return fonts
+    const missing = '__no_such_family__'
+    const text = '漢字ABCxyz'
+    ctx.font = `48px "${missing}", sans-serif`
+    const fallback = ctx.measureText(text).width
+    /** 与「不存在的族」渲染宽度相同 → 该名字没被解析，浏览器回退了。 */
+    const usable = (family: string): boolean => {
+      ctx.font = `48px "${family}", "${missing}", sans-serif`
+      return ctx.measureText(text).width !== fallback
+    }
+
+    // 尾部可能是字重词、纯数字字重，或两者叠加（"… 3.0 105 Heavy"）
+    const tail = /\s+(\d+|Thin|ExtraLight|UltraLight|Light|Regular|Book|Medium|SemiBold|DemiBold|Bold|ExtraBold|UltraBold|Black|Heavy|Italic|Oblique|Condensed|Narrow|L[1-9])$/i
+    const out = new Set<string>()
+    for (const name of fonts) {
+      if (usable(name)) {
+        out.add(name)
+        continue
+      }
+      let base = name
+      for (let i = 0; i < 4; i++) {
+        const next = base.replace(tail, '').trim()
+        if (!next || next === base) break
+        base = next
+        if (usable(base)) {
+          out.add(base)
+          break
+        }
+      }
+    }
+    return [...out]
+  }
+
+  /** 载入系统已安装字体，替换内置的精简列表。 */
+  private async loadSystemFonts(): Promise<void> {
+    try {
+      const fonts = await window.compositor.listFonts()
+      if (fonts.length > 0) {
+        this.systemFonts = sortFonts(await this.filterUsableFonts(fonts))
+        if (this.tool === 'text') this.buildOptionsBar()
+        this.logOp(`已载入 ${fonts.length} 个系统字体`)
+      }
+    } catch {
+      /* 读不到就继续用内置列表 */
+    }
+  }
+
   /** 把选项栏上的样式转成官方 text 元数据（RGB 为 0–1）。 */
+  /** 当前描边设置（宽度为 0 时不描边）。 */
+  private strokeMeta(): { width: number; red: number; green: number; blue: number } | undefined {
+    if (this.textStyle.strokeWidth <= 0) return undefined
+    const [r, g, b] = hexToRgb01(this.textStyle.strokeColor)
+    return { width: this.textStyle.strokeWidth, red: r, green: g, blue: b }
+  }
+
   private currentTextMeta(): TextStyle {
     const [r, g, b] = hexToRgb01(this.textStyle.color)
+    const stroke = this.strokeMeta()
     return {
       fontName: this.textStyle.fontName,
       fontSize: this.textStyle.fontSize,
@@ -1078,6 +1496,7 @@ class App {
       alignment: this.textStyle.alignment,
       tracking: this.textStyle.tracking,
       lineSpacing: this.textStyle.lineSpacing,
+      ...(stroke ? { textStroke: stroke } : {}),
     }
   }
 
@@ -1099,7 +1518,8 @@ class App {
   }
 
   /** 在画布上叠一个 textarea 做内联编辑，边输入边重绘图层像素。 */
-  private openTextEditor(layerID: string): void {
+  /** selectAll 用于刚新建的空文字，方便直接覆盖输入；编辑已有文字时把光标放到末尾。 */
+  private openTextEditor(layerID: string, selectAll = false): void {
     const layer = this.editor.find(layerID)
     if (!layer?.text) return
     this.closeTextEditor(false)
@@ -1128,10 +1548,30 @@ class App {
         this.closeTextEditor(true)
       }
     })
-    ta.addEventListener('blur', () => this.closeTextEditor(true))
+    // 延迟一帧再确认失焦：焦点有可能被瞬时抢走又还回来，
+    // 立刻提交会把刚建的空图层误删（表现为「点了没反应」）。
+    ta.addEventListener('blur', () => {
+      window.setTimeout(() => {
+        if (this.textEditor !== ta) return
+        if (document.activeElement === ta) return
+        // 焦点落回选项栏或工具栏时不要关闭编辑器：用户正是要点那里改字体/颜色/字号，
+        // 一旦关掉就丢了选中的那段文字，没法再给选区单独设样式。
+        const next = document.activeElement
+        if (next instanceof Element && next.closest('.options-bar, .toolbar')) return
+        this.closeTextEditor(true)
+      }, 0)
+    })
 
-    ta.focus()
-    ta.select()
+    // 放到下一帧再聚焦：若 pointerdown 的默认行为发生在 focus() 之后，
+    // 会把焦点抢走。与上面的 preventDefault 互为双保险。
+    const takeFocus = (): void => {
+      if (this.textEditor !== ta) return
+      ta.focus()
+      if (selectAll) ta.select()
+      else ta.setSelectionRange(ta.value.length, ta.value.length)
+    }
+    takeFocus()
+    window.requestAnimationFrame(takeFocus)
   }
 
   /**
@@ -1183,16 +1623,18 @@ class App {
     const z = this.view.zoom
     ta.style.left = `${this.view.panX + t.origin[0] * z}px`
     ta.style.top = `${this.view.panY + t.origin[1] * z}px`
-    ta.style.width = `${Math.max(60, t.size[0] * z)}px`
-    ta.style.height = `${Math.max(28, t.size[1] * z)}px`
+    // 空文字图层的画布只有 2px 宽，编辑框会窄到看不见（点下去像「没反应」），
+    // 所以给一个可用的下限。
+    ta.style.width = `${Math.max(240, t.size[0] * z)}px`
+    ta.style.height = `${Math.max(t.size[1] * z, layer.text.fontSize * z * 1.4, 28)}px`
     ta.style.fontFamily = `"${layer.text.fontName}", "Microsoft YaHei UI", sans-serif`
     ta.style.fontSize = `${layer.text.fontSize * z}px`
     ta.style.lineHeight = `${(layer.text.fontSize + layer.text.lineSpacing) * z}px`
     ta.style.textAlign = layer.text.alignment
     ta.style.letterSpacing = `${layer.text.tracking * z}px`
-    ta.style.color = `rgb(${Math.round(layer.text.red * 255)}, ${Math.round(
-      layer.text.green * 255,
-    )}, ${Math.round(layer.text.blue * 255)})`
+    // 绝对不要在这里设置 color：编辑器里的字必须保持透明（见 styles.css），
+    // 用户看到的应当是画布上实时渲染的文字。这里一旦设成图层颜色，
+    // 两套字形就会叠在一起——那正是「重影」的来源。
   }
 
   /** 选项栏显示用的样式：选中文字图层就显示它的，否则显示新建默认值。 */
@@ -1207,6 +1649,10 @@ class App {
         alignment: t.alignment,
         tracking: t.tracking,
         lineSpacing: t.lineSpacing,
+        strokeWidth: t.textStroke?.width ?? 0,
+        strokeColor: t.textStroke
+          ? rgb01ToHex(t.textStroke.red, t.textStroke.green, t.textStroke.blue)
+          : '#000000',
       }
     }
     return this.textStyle
@@ -1215,23 +1661,100 @@ class App {
   /** 改文字样式：有选中的文字图层就应用上去，同时记为下次新建的默认样式。 */
   private updateTextStyle(patch: Partial<typeof this.textStyle>): void {
     this.textStyle = { ...this.textStyle, ...patch }
-    this.buildOptionsBar()
 
-    const layer = this.editor.activeLayer
-    if (!layer?.text) return
-    const rgb = patch.color ? hexToRgb01(patch.color) : null
-    this.editor.applyText(layer.id, (t) => {
-      if (patch.fontName !== undefined) t.fontName = patch.fontName
-      if (patch.fontSize !== undefined) t.fontSize = patch.fontSize
-      if (patch.alignment !== undefined) t.alignment = patch.alignment
-      if (patch.tracking !== undefined) t.tracking = patch.tracking
-      if (patch.lineSpacing !== undefined) t.lineSpacing = patch.lineSpacing
-      if (rgb) {
-        t.red = rgb[0]
-        t.green = rgb[1]
-        t.blue = rgb[2]
+    // 选项栏的显示来自「当前图层的样式」，所以重建**必须放在应用之后**。
+    // 原先在开头重建，读到的是尚未更新的旧值 —— 于是选了新字体，选择栏还显示旧字体，
+    // 得再选一次才跟上。用 finally 保证提前 return 的分支也会重建。
+    try {
+      const layer = this.editor.activeLayer
+      if (!layer?.text) return
+
+      // 编辑框里有选区时，只把改动应用到选中的那一段（富文本 run），整层样式保持不变
+      // —— 这就是「单独修改选中文字」。
+      const ta = this.textEditor
+      if (ta && this.editingTextID === layer.id && ta.selectionEnd > ta.selectionStart) {
+        this.paintTextRuns(layer.id, ta.selectionStart, ta.selectionEnd - ta.selectionStart, patch)
+        return
       }
-    })
+
+      const rgb = patch.color ? hexToRgb01(patch.color) : null
+      this.editor.applyText(layer.id, (t) => {
+        // 改整层样式时，必须清掉对应的局部 run —— 否则被 run 覆盖的那几个字仍用旧值，
+        // 看上去就像「部分文字替换不成功」（改了字体，偏偏有几个字纹丝不动）。
+        if (patch.fontName !== undefined) {
+          t.fontName = patch.fontName
+          delete t.fontRuns
+        }
+        if (patch.fontSize !== undefined) {
+          t.fontSize = patch.fontSize
+          delete t.sizeRuns
+        }
+        if (patch.alignment !== undefined) t.alignment = patch.alignment
+        if (patch.tracking !== undefined) t.tracking = patch.tracking
+        if (patch.lineSpacing !== undefined) t.lineSpacing = patch.lineSpacing
+        if (patch.strokeWidth !== undefined || patch.strokeColor !== undefined) {
+          t.textStroke = this.strokeMeta()
+        }
+        if (rgb) {
+          t.red = rgb[0]
+          t.green = rgb[1]
+          t.blue = rgb[2]
+          delete t.colorRuns
+        }
+      })
+      this.invalidate()
+    } finally {
+      // 只**就地更新**选项栏，绝不整体重建。
+      // 重建（clear + 重新 append）会把用户正在操作的控件从 DOM 里移除：
+      // 拖动 <input type="color"> 时原生取色器会立刻关闭、拖动滑块会被打断。
+      // 字体选择器的显示改成调它的 setValue()，效果一样但对既有控件零干扰。
+      if (patch.fontName !== undefined) this.fontPickerHandle?.setValue(patch.fontName)
+    }
+  }
+
+  /**
+   * 把样式改动写到 [start, start+len) 这段字符上（fontRuns / colorRuns / sizeRuns）。
+   * 与这段相交的旧 run 会被裁掉，然后把新 run 并进来。
+   */
+  private paintTextRuns(
+    layerID: string,
+    start: number,
+    length: number,
+    patch: Partial<typeof this.textStyle>,
+  ): void {
+    const rgb = patch.color ? hexToRgb01(patch.color) : null
+    this.editor.applyText(
+      layerID,
+      (t) => {
+        if (patch.fontName !== undefined) {
+          const name = patch.fontName
+          t.fontRuns = paintRun(t.fontRuns, start, length, (loc, len) => ({
+            location: loc,
+            length: len,
+            fontName: name,
+          }))
+        }
+        if (rgb) {
+          const [r0, g0, b0] = rgb
+          t.colorRuns = paintRun(t.colorRuns, start, length, (loc, len) => ({
+            location: loc,
+            length: len,
+            red: r0,
+            green: g0,
+            blue: b0,
+          }))
+        }
+        if (patch.fontSize !== undefined) {
+          const size = patch.fontSize
+          t.sizeRuns = paintRun(t.sizeRuns, start, length, (loc, len) => ({
+            location: loc,
+            length: len,
+            fontSize: size,
+          }))
+        }
+      },
+      '局部文字样式',
+    )
     this.invalidate()
   }
 
@@ -1387,7 +1910,7 @@ class App {
     ctx.restore()
     this.showGrid = this.showGrid
     void this.showGrid
-    px.version++
+    bumpPixels(px)
     this.invalidate()
   }
 
@@ -1440,43 +1963,7 @@ class App {
           break
       }
     }
-    px.version++
-    this.invalidate()
-  }
-
-  private commitGradient(ex: number, ey: number): void {
-    if (this.drag.kind !== 'gradient') return
-    const layer = this.editor.activeLayer
-    if (!layer || layer.isGroup || layer.adjustment) {
-      toast('渐变需要先选中一个像素图层')
-      return
-    }
-    const px = this.editor.pixelStore.get(layer.id)
-    if (!px) return
-    const { startX, startY } = this.drag
-    this.editor.edit(
-      '渐变填充',
-      () => {
-        const ctx = px.canvas.getContext('2d')!
-        const t = layer.transform
-        const toLocal = (x: number, y: number): [number, number] => [
-          ((x - t.origin[0]) / t.size[0]) * px.canvas.width,
-          ((y - t.origin[1]) / t.size[1]) * px.canvas.height,
-        ]
-        const [ax, ay] = toLocal(startX, startY)
-        const [bx, by] = toLocal(ex, ey)
-        const grad = ctx.createLinearGradient(ax, ay, bx, by)
-        grad.addColorStop(0, hexToRgba(this.brush.color, this.brush.opacity))
-        grad.addColorStop(1, 'rgba(0,0,0,0)')
-        ctx.save()
-        ctx.globalCompositeOperation = 'source-over'
-        ctx.fillStyle = grad
-        ctx.fillRect(0, 0, px.canvas.width, px.canvas.height)
-        ctx.restore()
-        px.version++
-      },
-      [layer.id],
-    )
+    bumpPixels(px)
     this.invalidate()
   }
 
@@ -1506,6 +1993,72 @@ class App {
       return
     }
     this.applyCrop(x0, y0, w, h)
+  }
+
+  /** 该图层在文档坐标 (x,y) 处是否有不透明像素。 */
+  private layerHasPixelAt(layer: LayerRecord, x: number, y: number): boolean {
+    if (layer.isGroup || layer.adjustment || !layer.isVisible) return false
+    const px = this.editor.pixelStore.get(layer.id)
+    if (!px) return false
+    const t = layer.transform
+    if (x < t.origin[0] || x > t.origin[0] + t.size[0]) return false
+    if (y < t.origin[1] || y > t.origin[1] + t.size[1]) return false
+    const lx = Math.floor(((x - t.origin[0]) / Math.max(t.size[0], 1e-6)) * px.canvas.width)
+    const ly = Math.floor(((y - t.origin[1]) / Math.max(t.size[1], 1e-6)) * px.canvas.height)
+    if (lx < 0 || ly < 0 || lx >= px.canvas.width || ly >= px.canvas.height) return false
+    const ctx = px.canvas.getContext('2d')
+    if (!ctx) return false
+    return (ctx.getImageData(lx, ly, 1, 1).data[3] ?? 0) > 8
+  }
+
+  /** 命中最上层「该处确实有像素」的图层（用于移动工具的自动选择）。 */
+  private layerAtDoc(x: number, y: number): LayerRecord | null {
+    for (const { layer } of this.editor.flattenForPanel()) {
+      if (this.layerHasPixelAt(layer, x, y)) return layer
+    }
+    return null
+  }
+
+  /**
+   * 命中四角手柄（容差按屏幕像素给，缩放后手感一致）。
+   * 取**最近**的那个角：容差范围内可能同时罩住两个角，选错会跳到错误的缩放方向。
+   */
+  private handleAt(x: number, y: number, layer: LayerRecord): 'nw' | 'ne' | 'sw' | 'se' | null {
+    const t = layer.transform
+    // 容差取「屏幕 10px」与「图层短边的 1/4」中较小者。
+    // 只按 10/zoom 算的话，视图缩小时容差会大到覆盖整个图层——
+    // 用户在图层中间按下想拖动，实际抓到的却是角手柄，
+    // 而缩放是对角固定的，表现就是「往右拖却往左缩」。
+    const screenTol = 10 / Math.max(this.view.zoom, 0.01)
+    const sizeLimit = Math.max(2, Math.min(t.size[0], t.size[1]) * 0.25)
+    const tol = Math.min(screenTol, sizeLimit)
+    const right = t.origin[0] + t.size[0]
+    const bottom = t.origin[1] + t.size[1]
+    const corners: ['nw' | 'ne' | 'sw' | 'se', number, number][] = [
+      ['nw', t.origin[0], t.origin[1]],
+      ['ne', right, t.origin[1]],
+      ['sw', t.origin[0], bottom],
+      ['se', right, bottom],
+    ]
+    let best: 'nw' | 'ne' | 'sw' | 'se' | null = null
+    let bestDist = tol
+    for (const [name, cx, cy] of corners) {
+      const d = Math.hypot(x - cx, y - cy)
+      if (d <= bestDist) {
+        bestDist = d
+        best = name
+      }
+    }
+    return best
+  }
+
+  /** 移动工具下要显示变换框的图层矩形（文档坐标）。 */
+  private transformRectOf(): [number, number, number, number] | null {
+    if (this.tool !== 'move') return null
+    const layer = this.editor.activeLayer
+    if (!layer) return null
+    const t = layer.transform
+    return [t.origin[0], t.origin[1], t.size[0], t.size[1]]
   }
 
   /** 提交一个形状：按拖出的矩形建立形状图层。 */
@@ -1595,7 +2148,19 @@ class App {
 
   // —— 面板与命令 ——
 
-  private panelAction(action: Parameters<LayersPanel['render']> extends never ? never : 'new' | 'newGroup' | 'newAdjust' | 'duplicate' | 'delete' | 'mask' | 'clip' | 'up' | 'down'): void {
+  private panelAction(
+    action:
+      | 'new'
+      | 'newGroup'
+      | 'newAdjust'
+      | 'effects'
+      | 'duplicate'
+      | 'delete'
+      | 'mask'
+      | 'clip'
+      | 'up'
+      | 'down',
+  ): void {
     const active = this.editor.activeLayer
     switch (action) {
       case 'new':
@@ -1619,6 +2184,17 @@ class App {
       case 'clip':
         if (active) this.editor.toggleClipping(active.id)
         break
+      case 'effects': {
+        if (!active || active.isGroup || active.adjustment) {
+          toast('请先选中一个像素或文字图层')
+          break
+        }
+        openEffectsDialog(this.editor, active, () => {
+          this.layersPanel.render()
+          this.invalidate()
+        })
+        break
+      }
       case 'up':
         if (active) this.editor.raiseLayer(active.id, false)
         break
@@ -1682,6 +2258,8 @@ class App {
           return await this.saveProject(true)
         case 'file.import':
           return await this.importImages()
+        case 'file.exportPsd':
+          return await this.exportPSD()
         case 'file.exportPng':
           return await this.exportImage('png')
         case 'file.exportJpeg':
@@ -1698,6 +2276,12 @@ class App {
         case 'edit.redo':
           this.editor.redo()
           return
+        case 'edit.copy':
+          return this.copyLayerToClipboard(false)
+        case 'edit.cut':
+          return this.copyLayerToClipboard(true)
+        case 'edit.paste':
+          return this.pasteClipboard()
         case 'select.all':
           this.selectionMask = new Uint8ClampedArray(this.editor.manifest.width * this.editor.manifest.height).fill(255)
           this.buildOptionsBar()
@@ -1712,8 +2296,8 @@ class App {
           this.editor.addLayer()
           return
         case 'layer.duplicate':
-          this.editor.duplicateLayers([...this.editor.selection])
-          return
+          // Ctrl+J：有选区时只拷贝选区内的像素
+          return this.copyToNewLayer()
         case 'layer.delete':
           this.editor.deleteLayers([...this.editor.selection])
           return
@@ -1805,6 +2389,8 @@ class App {
           return
         case 'help.about':
           return this.showAbout()
+        case 'help.diagnostics':
+          return this.showDiagnostics()
       }
     } catch (err) {
       const msg = err instanceof CompFormatError ? err.message : (err as Error).message
@@ -1956,28 +2542,84 @@ class App {
     this.editor.setTransform(layer.id, {
       origin: [Math.round((doc.width - image.width) / 2), Math.round((doc.height - image.height) / 2)],
     })
+    this.logOp(`导入 ${name}（图片 ${image.width}×${image.height}）→ ${this.describe(layer)}`)
     toast(`已导入 ${name}`)
   }
 
   /** PSD/PSB：按合成预览导入为一个图层（分层解析不在 MVP 范围内）。 */
+  /**
+   * 读取分层 PSD，把每个像素图层建成一个图层。
+   *
+   * 支持范围见 `psd.ts` 的说明（分层 RGB 子集）。PSD 里的组、蒙版、图层效果、
+   * 文字/形状的可编辑性都不保留 —— 写出时它们本来就是光栅。
+   */
   private async importPSD(name: string, bytes: Uint8Array): Promise<void> {
-    const image = await decodeImage(bytes)
-    if (!image) {
+    let parsed: ReturnType<typeof importPsd>
+    try {
+      // Uint8Array 可能只是底层 buffer 的一段，必须按 offset/length 切出准确范围
+      const buf = bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength,
+      ) as ArrayBuffer
+      parsed = importPsd(buf)
+    } catch (err) {
       modal({
-        title: '无法导入该 Photoshop 文件',
+        title: '无法读取该 PSD',
         body: [
           el('div', {
             class: 'error-box',
-            text: `当前版本只能导入浏览器能解码的 PSD 预览。\n${name} 里的图像数据无法直接读取。\n\n提示：在 Photoshop 中导出为 PNG 后再导入，可完整保留画面。`,
+            text: `读取「${name}」时出错：\n${(err as Error).message}\n\n当前版本支持分层 RGB 的 PSD；CMYK、16 位或带图层蒙版的复杂文件可能读不了。`,
           }),
         ],
         infoOnly: true,
       })
       return
     }
-    const layer = this.editor.addImageLayer(name.replace(/\.[^.]+$/, ''), image)
-    void layer
-    toast(`已导入 ${name}（合成预览）`)
+
+    if (parsed.layers.length === 0) {
+      // 只有合成图、没有可用像素图层时，退回浏览器解码（至少能把画面带进来）
+      await this.importImageBytes(name, bytes)
+      return
+    }
+
+    // 尺寸不一致就按 PSD 新建文档；一致则并入当前文档
+    const doc = this.editor.manifest
+    if (doc.width !== parsed.width || doc.height !== parsed.height) {
+      this.editor.replaceDocument(createDocument(parsed.width, parsed.height))
+      this.fitToWindow()
+    }
+
+    for (const item of parsed.layers) {
+      const layer = this.editor.addImageLayer(item.name, item.image)
+      this.editor.edit('导入 PSD 图层', () => {
+        layer.transform.origin = [item.x, item.y]
+        layer.transform.size = [item.image.width, item.image.height]
+        layer.opacity = item.opacity
+        layer.isVisible = item.visible
+        layer.blendMode = item.blendMode
+      })
+    }
+    this.invalidate()
+    this.layersPanel.render()
+    this.propsPanel.render()
+    toast(`已导入 ${name}：${parsed.layers.length} 个图层`)
+  }
+
+  /** 把当前文档导出为分层 PSD。 */
+  private async exportPSD(): Promise<void> {
+    let bytes: Uint8Array
+    try {
+      bytes = exportPsd(this.editor.manifest, (id) => this.editor.pixelStore.get(id))
+    } catch (err) {
+      toast(`导出 PSD 失败：${(err as Error).message}`)
+      return
+    }
+    const path = await window.compositor.saveImage({
+      suggested: '未命名',
+      format: 'psd',
+      bytes,
+    })
+    if (path) toast(`已导出 ${path}`)
   }
 
   private async exportImage(format: 'png' | 'jpeg'): Promise<void> {
@@ -2013,7 +2655,7 @@ class App {
           }),
           el('div', {
             class: 'prop-hint',
-            text: `快捷键：V 移动 · M 矩形选框 · L 套索 · W 魔棒 · B 画笔 · E 橡皮 · G 渐变 · I 吸管 · C 裁剪 · H 抓手 · Z 缩放\n空格拖动平移 · Ctrl+滚轮缩放 · Ctrl+S 保存 · Ctrl+Z 撤销`,
+            text: `快捷键：V 移动 · M 矩形选框 · L 套索 · W 魔棒 · B 画笔 · E 橡皮 · I 吸管 · C 裁剪 · H 抓手 · Z 缩放\n空格拖动平移 · Ctrl+滚轮缩放 · Ctrl+S 保存 · Ctrl+Z 撤销`,
           }),
           el('div', {
             class: 'prop-hint',
@@ -2116,6 +2758,92 @@ function floodSelect(image: ImageData, sx: number, sy: number, tolerance: number
   return out
 }
 
+/**
+ * 按文档坐标的选区蒙版处理图层像素。
+ * keepInside = true 保留选区内（复制），false 保留选区外（剪切 / 删除）。
+ */
+function applySelectionMask(
+  image: ImageData,
+  mask: Uint8ClampedArray,
+  docW: number,
+  docH: number,
+  transform: { origin: readonly [number, number]; size: readonly [number, number] },
+  keepInside: boolean,
+): void {
+  const { width, height, data } = image
+  const [ox, oy] = transform.origin
+  const [sw, sh] = transform.size
+  if (sw <= 0 || sh <= 0) return
+
+  for (let y = 0; y < height; y++) {
+    const docY = Math.floor(oy + ((y + 0.5) / height) * sh)
+    for (let x = 0; x < width; x++) {
+      const docX = Math.floor(ox + ((x + 0.5) / width) * sw)
+      const inDoc = docX >= 0 && docX < docW && docY >= 0 && docY < docH
+      const inside = inDoc && mask[docY * docW + docX]! > 127
+      if (inside !== keepInside) data[(y * width + x) * 4 + 3] = 0
+    }
+  }
+}
+
+/**
+ * 求不透明像素的包围盒（图层本地像素坐标）。空图返回 null。
+ */
+function opaqueBounds(image: ImageData): [number, number, number, number] | null {
+  const { width, height, data } = image
+  let minX = width
+  let minY = height
+  let maxX = -1
+  let maxY = -1
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (data[(y * width + x) * 4 + 3]! > 8) {
+        if (x < minX) minX = x
+        if (y < minY) minY = y
+        if (x > maxX) maxX = x
+        if (y > maxY) maxY = y
+      }
+    }
+  }
+  if (maxX < 0) return null
+  return [minX, minY, maxX - minX + 1, maxY - minY + 1]
+}
+
+/** 从 ImageData 里裁出一块。 */
+function cropImageData(image: ImageData, box: [number, number, number, number]): ImageData {
+  const [bx, by, bw, bh] = box
+  const out = new ImageData(bw, bh)
+  const rowBytes = bw * 4
+  for (let y = 0; y < bh; y++) {
+    const src = ((by + y) * image.width + bx) * 4
+    out.data.set(image.data.subarray(src, src + rowBytes), y * rowBytes)
+  }
+  return out
+}
+
+/** 在 run 列表上把 [start, start+len) 设为新 run；与之相交的旧 run 会被裁掉两侧保留。 */
+function paintRun<T extends { location: number; length: number }>(
+  runs: T[] | undefined,
+  start: number,
+  length: number,
+  make: (location: number, length: number) => T,
+): T[] {
+  const end = start + length
+  const out: T[] = []
+  for (const run of runs ?? []) {
+    const a = run.location
+    const b = run.location + run.length
+    if (b <= start || a >= end) {
+      out.push(run)
+      continue
+    }
+    if (a < start) out.push({ ...run, length: start - a })
+    if (b > end) out.push({ ...run, location: end, length: b - end })
+  }
+  out.push(make(start, length))
+  return out.sort((p, q) => p.location - q.location)
+}
+
 /** 选一个「屏幕上大约 80px 一格」的标尺步长（文档像素）。 */
 function chooseRulerStep(zoom: number): number {
   const wanted = 80 / Math.max(zoom, 1e-6)
@@ -2211,7 +2939,7 @@ try {
       if (!ctx) throw new Error('缺少 2D 上下文')
       ctx.fillStyle = '#ff0000'
       ctx.fillRect(8, 8, 32, 24)
-      px.version++
+      bumpPixels(px)
       app.editor.addMask(layer.id, true)
       app.editor.addAdjustmentLayer('Invert', '反相')
       await app.saveInto(dir)
@@ -2477,7 +3205,7 @@ try {
       if (!ctx) throw new Error('缺少 2D 上下文')
       ctx.fillStyle = '#ffffff'
       ctx.fillRect(0, 0, 8, 8)
-      px.version++
+      bumpPixels(px)
       app.editor.setTransform(layer.id, { origin: [28, 20], size: [8, 8] })
 
       const sample = (x: number, y: number): number[] => {
@@ -2589,7 +3317,7 @@ try {
         ctx.fillRect(0, 0, 16, 32)
         ctx.fillStyle = '#0000ff'
         ctx.fillRect(16, 0, 16, 32)
-        px.version++
+        bumpPixels(px)
         app.editor.setTransform(layer.id, { origin: [0, 0], size: [32, 32] })
         return layer.id
       }
@@ -2647,6 +3375,1362 @@ try {
       result['liquify'] = diff(id, before)
 
       return result
+    },
+
+    /**
+     * 方向探针：图层上半红下半蓝，检查**屏幕**上那一半是红的。
+     * 用来确诊渲染管线是否发生了垂直翻转。
+     */
+    async orientationProbe(): Promise<{
+      screenTop: number[]
+      screenBottom: number[]
+      compositeTop: number[]
+      compositeBottom: number[]
+      screenOriented: boolean
+      compositeOriented: boolean
+    }> {
+      app.editor.replaceDocument(createDocument(32, 32))
+      // 同样必须重新适配视图，否则采样坐标会沿用上一个文档的缩放/平移
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+      const layer = app.editor.addLayer('方向')
+      const px = app.editor.pixelStore.create(layer.id, 32, 32)
+      const ctx = px.canvas.getContext('2d')
+      if (!ctx) throw new Error('缺少 2D 上下文')
+      ctx.fillStyle = '#ff0000'
+      ctx.fillRect(0, 0, 32, 16) // 上半红
+      ctx.fillStyle = '#0000ff'
+      ctx.fillRect(0, 16, 32, 16) // 下半蓝
+      bumpPixels(px)
+      app.editor.setTransform(layer.id, { origin: [0, 0], size: [32, 32] })
+
+      const at = (img: ImageData, x: number, y: number): number[] => {
+        const i = (Math.round(y) * img.width + Math.round(x)) * 4
+        return [img.data[i]!, img.data[i + 1]!, img.data[i + 2]!]
+      }
+
+      // 屏幕：按文档在屏幕上的矩形取上半/下半
+      app.renderFrame()
+      const screen = app.readScreen()
+      const dpr = window.devicePixelRatio || 1
+      const z = app.view.zoom * dpr
+      const cx = app.view.panX * dpr + 16 * z
+      const screenTop = at(screen, cx, app.view.panY * dpr + 4 * z)
+      const screenBottom = at(screen, cx, app.view.panY * dpr + 28 * z)
+
+      // 合成结果：按文档坐标取上半/下半
+      const composite = app.readComposite()
+      const compositeTop = at(composite, 16, 4)
+      const compositeBottom = at(composite, 16, 28)
+
+      const isRed = (c: number[]): boolean => c[0]! > 180 && c[2]! < 80
+      return {
+        screenTop,
+        screenBottom,
+        compositeTop,
+        compositeBottom,
+        screenOriented: isRed(screenTop) && !isRed(screenBottom),
+        compositeOriented: isRed(compositeTop) && !isRed(compositeBottom),
+      }
+    },
+
+    /**
+     * 复制图层探针：复制一个「上红下蓝」的图层，
+     * 检查副本的像素是否与原件逐字节一致（不能发生翻转或错位）。
+     */
+    async duplicateProbe(): Promise<{
+      identical: boolean
+      srcTop: number[]
+      copyTop: number[]
+      copyBottom: number[]
+      copyName: string
+    }> {
+      app.editor.replaceDocument(createDocument(32, 32))
+      const layer = app.editor.addLayer('原层')
+      const px = app.editor.pixelStore.create(layer.id, 32, 32)
+      const ctx = px.canvas.getContext('2d')
+      if (!ctx) throw new Error('缺少 2D 上下文')
+      ctx.fillStyle = '#ff0000'
+      ctx.fillRect(0, 0, 32, 16)
+      ctx.fillStyle = '#0000ff'
+      ctx.fillRect(0, 16, 32, 16)
+      bumpPixels(px)
+      app.editor.setTransform(layer.id, { origin: [0, 0], size: [32, 32] })
+
+      app.editor.select(layer.id)
+      app.editor.duplicateLayers([layer.id])
+
+      const copy = app.editor.manifest.layers.find((l) => l.id !== layer.id)
+      const read = (id: string): Uint8ClampedArray => {
+        const p = app.editor.pixelStore.get(id)
+        if (!p) return new Uint8ClampedArray()
+        return p.canvas.getContext('2d')!.getImageData(0, 0, 32, 32).data
+      }
+      const src = read(layer.id)
+      const dst = copy ? read(copy.id) : new Uint8ClampedArray()
+
+      let identical = src.length > 0 && src.length === dst.length
+      if (identical) {
+        for (let i = 0; i < src.length; i++) {
+          if (src[i] !== dst[i]) {
+            identical = false
+            break
+          }
+        }
+      }
+      const at = (d: Uint8ClampedArray, x: number, y: number): number[] => {
+        const i = (y * 32 + x) * 4
+        return [d[i]!, d[i + 1]!, d[i + 2]!]
+      }
+      return {
+        identical,
+        srcTop: at(src, 16, 4),
+        copyTop: at(dst, 16, 4),
+        copyBottom: at(dst, 16, 28),
+        copyName: copy?.name ?? '',
+      }
+    },
+
+    /** 选区复制探针：整张红色图层 + 左半边选区，Ctrl+J 应只复制左半边。 */
+    async selectionCopyProbe(): Promise<{
+      copiedOpaque: number
+      copyName: string
+      copyCanvas: string
+      srcCanvas: string
+    }> {
+      app.editor.replaceDocument(createDocument(32, 32))
+      const layer = app.editor.addLayer('源')
+      const px = app.editor.pixelStore.create(layer.id, 32, 32)
+      const ctx = px.canvas.getContext('2d')
+      if (!ctx) throw new Error('缺少 2D 上下文')
+      ctx.fillStyle = '#ff0000'
+      ctx.fillRect(0, 0, 32, 32)
+      bumpPixels(px)
+      app.editor.setTransform(layer.id, { origin: [0, 0], size: [32, 32] })
+      app.editor.select(layer.id)
+
+      // 选区 = 左半边
+      const mask = new Uint8ClampedArray(32 * 32)
+      for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 16; x++) mask[y * 32 + x] = 255
+      }
+      app.selectionMask = mask
+
+      ;(app as unknown as { copyToNewLayer(): void }).copyToNewLayer()
+
+      const copy = app.editor.manifest.layers.find((l) => l.name.includes('副本'))
+      const cpx = copy ? app.editor.pixelStore.get(copy.id) : null
+      let copiedOpaque = 0
+      if (cpx) {
+        // 副本现在会被裁到选区内容的大小，必须按它自己的尺寸遍历
+        const cw = cpx.canvas.width
+        const ch = cpx.canvas.height
+        const img = cpx.canvas.getContext('2d')!.getImageData(0, 0, cw, ch)
+        for (let i = 3; i < img.data.length; i += 4) {
+          if (img.data[i]! > 0) copiedOpaque++
+        }
+      }
+      return {
+        copiedOpaque,
+        copyName: copy?.name ?? '',
+        copyCanvas: cpx ? `${cpx.canvas.width}×${cpx.canvas.height}` : '无',
+        srcCanvas: `${px.canvas.width}×${px.canvas.height}`,
+      }
+    },
+
+    /** 缩放探针：命中右下角手柄后放大，尺寸应当改变。 */
+    async scaleProbe(): Promise<{ hit: string | null; size: number[]; resized: boolean }> {
+      app.editor.replaceDocument(createDocument(64, 48))
+      const layer = app.editor.addLayer('缩放')
+      const px = app.editor.pixelStore.create(layer.id, 20, 10)
+      const ctx = px.canvas.getContext('2d')
+      if (!ctx) throw new Error('缺少 2D 上下文')
+      ctx.fillStyle = '#00c853'
+      ctx.fillRect(0, 0, 20, 10)
+      bumpPixels(px)
+      app.editor.setTransform(layer.id, { origin: [10, 10], size: [20, 10] })
+      app.editor.select(layer.id)
+      app.tool = 'move'
+
+      const live = app.editor.find(layer.id)!
+      const hit = (
+        app as unknown as { handleAt(x: number, y: number, l: unknown): string | null }
+      ).handleAt(30, 20, live)
+
+      app.editor.setTransform(layer.id, { size: [40, 20], origin: [10, 10] })
+      const after = app.editor.find(layer.id)!
+      const size = [...after.transform.size]
+      return { hit, size, resized: size[0] === 40 && size[1] === 20 }
+    },
+
+    /**
+     * 导入流程探针：导入一张「三色横条 + 左白条」的图（能同时看出左右与上下），
+     * 缩放后再复制，逐步打印每个阶段的 transform 与画布尺寸。
+     */
+    async importFlowProbe(): Promise<Record<string, unknown>> {
+      const info = (l: LayerRecord): Record<string, unknown> => {
+        const p = app.editor.pixelStore.get(l.id)
+        return {
+          name: l.name,
+          origin: [...l.transform.origin],
+          size: [...l.transform.size],
+          flipX: l.transform.flipX,
+          flipY: l.transform.flipY,
+          rotation: l.transform.rotation,
+          canvas: p ? [p.canvas.width, p.canvas.height] : [0, 0],
+        }
+      }
+
+      app.editor.replaceDocument(createDocument(400, 300))
+
+      const c = new OffscreenCanvas(80, 60)
+      const cx = c.getContext('2d')
+      if (!cx) throw new Error('缺少 2D 上下文')
+      cx.fillStyle = '#ff0000'
+      cx.fillRect(0, 0, 80, 20)
+      cx.fillStyle = '#00ff00'
+      cx.fillRect(0, 20, 80, 20)
+      cx.fillStyle = '#0000ff'
+      cx.fillRect(0, 40, 80, 20)
+      cx.fillStyle = '#ffffff'
+      cx.fillRect(0, 0, 8, 60)
+      const blob = await c.convertToBlob({ type: 'image/png' })
+      const bytes = new Uint8Array(await blob.arrayBuffer())
+
+      await (
+        app as unknown as { importImageBytes(n: string, b: Uint8Array): Promise<void> }
+      ).importImageBytes('流程.png', bytes)
+      const src = app.editor.activeLayer!
+      const imported = info(src)
+
+      // 模拟用户拖角手柄放大 2 倍
+      app.editor.setTransform(src.id, { size: [160, 120] })
+      const afterScale = info(app.editor.find(src.id)!)
+
+      // 再复制
+      app.selectionMask = null
+      ;(app as unknown as { copyToNewLayer(): void }).copyToNewLayer()
+      const copy = app.editor.manifest.layers.find((l) => l.id !== src.id)!
+
+      return { imported, afterScale, copied: info(copy), copyIsDifferent: info(copy)['size'] }
+    },
+
+    /** 移动探针：模拟真实的 pointermove，检查图层位移是否跟手。 */
+    async moveProbe(): Promise<{
+      from: number[]
+      to: number[]
+      expected: number[]
+      drift: number
+    }> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      const layer = app.editor.addLayer('移动')
+      app.editor.setTransform(layer.id, { origin: [40, 40], size: [100, 80] })
+      app.editor.select(layer.id)
+
+      const host = document.getElementById('canvasHost')
+      if (!host) throw new Error('缺少画布宿主')
+      const rect = host.getBoundingClientRect()
+      const docToClient = (x: number, y: number): [number, number] => [
+        rect.left + app.view.panX + x * app.view.zoom,
+        rect.top + app.view.panY + y * app.view.zoom,
+      ]
+
+      const internals = app as unknown as {
+        drag: unknown
+        onPointerMove(ev: PointerEvent): void
+      }
+      const from: [number, number] = [40, 40]
+      const target: [number, number] = [103.5, 81.5] // 位移 (63.5, 41.5)
+      internals.drag = {
+        kind: 'move',
+        id: layer.id,
+        startX: from[0],
+        startY: from[1],
+        origin: [...from],
+      }
+      const [cx, cy] = docToClient(target[0], target[1])
+      internals.onPointerMove(new PointerEvent('pointermove', { clientX: cx, clientY: cy }))
+
+      const after = app.editor.find(layer.id)!
+      const to = [...after.transform.origin]
+      return {
+        from: [...from],
+        to,
+        expected: [target[0], target[1]],
+        drift: Math.hypot(to[0]! - target[0], to[1]! - target[1]),
+      }
+    },
+
+    /** PSD 往返探针：导出再读回，文档尺寸 / 图层数 / 尺寸 / 位置 / 像素都要一致。 */
+    async psdRoundTripProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(120, 90))
+      const size = 40
+      const image = new ImageData(size, size)
+      for (let i = 0; i < image.data.length; i += 4) {
+        image.data[i] = 0
+        image.data[i + 1] = 200
+        image.data[i + 2] = 80
+        image.data[i + 3] = 255
+      }
+      const layer = app.editor.addImageLayer('方块', image)
+      app.editor.edit('定位', () => {
+        layer.transform.origin = [17, 23]
+        layer.transform.size = [size, size]
+      })
+
+      const bytes = exportPsd(app.editor.manifest, (id) => app.editor.pixelStore.get(id))
+      const back = importPsd(
+        bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+      )
+      const first = back.layers[0]
+      let centerPixel = '(无)'
+      if (first) {
+        const cx = Math.floor(first.image.width / 2)
+        const cy = Math.floor(first.image.height / 2)
+        const i = (cy * first.image.width + cx) * 4
+        centerPixel = [
+          first.image.data[i]!,
+          first.image.data[i + 1]!,
+          first.image.data[i + 2]!,
+          first.image.data[i + 3]!,
+        ].join(',')
+      }
+      return {
+        exportedBytes: bytes.length,
+        docWidth: back.width,
+        docHeight: back.height,
+        layerCount: back.layers.length,
+        firstName: first?.name ?? '',
+        firstWidth: first?.image.width ?? 0,
+        firstHeight: first?.image.height ?? 0,
+        firstX: first?.x ?? -1,
+        firstY: first?.y ?? -1,
+        centerPixel,
+      }
+    },
+
+    /** 面板定位探针：选择器面板展开后必须完全落在窗口内（靠近边缘时要收边）。 */
+    async panelBoundsProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(200, 150))
+      app.tool = 'text'
+      const internals = app as unknown as { buildOptionsBar(): void }
+      internals.buildOptionsBar()
+
+      const result: Record<string, number | boolean> = {}
+      const check = (label: string, trigger: Element | null, panelSel: string): void => {
+        if (!(trigger instanceof HTMLElement)) {
+          result[`${label}Ok`] = false
+          return
+        }
+        trigger.click()
+        const panel = document.querySelector(panelSel)
+        if (!(panel instanceof HTMLElement)) {
+          result[`${label}Ok`] = false
+          return
+        }
+        const box = panel.getBoundingClientRect()
+        result[`${label}Ok`] = true
+        result[`${label}Left`] = Math.round(box.left)
+        result[`${label}Right`] = Math.round(box.right)
+        result[`${label}RightOverflow`] = box.right > window.innerWidth
+        result[`${label}LeftOverflow`] = box.left < 0
+        result[`${label}Viewport`] = window.innerWidth
+        trigger.click()
+      }
+
+      check('font', document.querySelector('.font-picker-btn'), '.font-picker-panel')
+      check('color', document.querySelector('.color-picker-swatch'), '.color-picker-panel')
+      return result
+    },
+
+    /** 颜色选择器探针：应为自绘（有色相条与十六进制输入），且选项栏里不再有原生颜色控件。 */
+    async colorPickerProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(200, 150))
+      app.tool = 'text'
+      const internals = app as unknown as { buildOptionsBar(): void }
+      internals.buildOptionsBar()
+
+      const legacyCount = document.querySelectorAll('.options-bar input[type=color]').length
+      const swatch = document.querySelector('.color-picker-swatch')
+      if (!(swatch instanceof HTMLElement)) return { ok: false, legacyCount }
+      swatch.click()
+
+      const panel = document.querySelector('.color-picker-panel')
+      const hex = document.querySelector('.color-picker-hex')
+      return {
+        ok: true,
+        legacyCount,
+        open: panel ? !panel.hasAttribute('hidden') : false,
+        hasHue: Boolean(document.querySelector('.color-picker-hue')),
+        hasSv: Boolean(document.querySelector('.color-picker-sv')),
+        hexValue: hex instanceof HTMLInputElement ? hex.value : '',
+      }
+    },
+
+    /** 选项栏稳定性探针：改样式不能重建选项栏（否则正在拖动的控件会被销毁）。 */
+    async optionsBarStabilityProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(200, 150))
+      app.tool = 'text'
+      const internals = app as unknown as {
+        buildOptionsBar(): void
+        updateTextStyle(patch: Record<string, unknown>): void
+      }
+      internals.buildOptionsBar()
+
+      // 颜色控件已改为自绘，这里检查它的色块按钮
+      const colorBefore = document.querySelector('.color-picker-swatch')
+      const fontBtnBefore = document.querySelector('.font-picker-btn')
+      const connected = (el: Element | null): boolean => Boolean(el && el.isConnected)
+
+      // 模拟拖动取色器：改一次颜色
+      internals.updateTextStyle({ color: '#ff0000' })
+
+      const colorAfter = document.querySelector('.color-picker-swatch')
+      const fontBtnAfter = document.querySelector('.font-picker-btn')
+      return {
+        // 同一个 DOM 对象仍在文档里 → 说明选项栏没有被重建，拖动不会被打断
+        colorSame: colorBefore !== null && colorBefore === colorAfter && connected(colorAfter),
+        fontBtnSame: fontBtnBefore !== null && fontBtnBefore === fontBtnAfter,
+        colorStillConnected: connected(colorBefore),
+      }
+    },
+
+    /** 控件外观探针：滑块与颜色框必须用统一令牌，不能是系统默认外观。 */
+    async widgetStyleProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(200, 150))
+      const internals = app as unknown as { buildOptionsBar(): void }
+
+      // 遍历各工具，找一个选项栏里确实带 range 的（不同工具的选项栏不一样）。
+      // 注意：必须在切到下一个工具**之前**读完样式 —— buildOptionsBar 会重建选项栏，
+      // 让旧元素脱离文档，而 getComputedStyle 对脱离文档的元素返回空值。
+      let rangeOk = false
+      let rangeAppearance = ''
+      let rangeHeight = ''
+      for (const t of ['brush', 'eraser', 'clone', 'heal', 'smudge', 'liquify', 'retouch']) {
+        app.tool = t as never
+        internals.buildOptionsBar()
+        const range = document.querySelector('.options-bar input[type=range]')
+        if (!range) continue
+        const cs = getComputedStyle(range)
+        rangeOk = true
+        // Chromium 里标准名 appearance 有时读不到，退回带前缀的那个
+        rangeAppearance =
+          (cs.getPropertyValue('appearance') || '').trim() ||
+          (cs.getPropertyValue('-webkit-appearance') || '').trim()
+        rangeHeight = cs.height
+        break
+      }
+
+      app.tool = 'text'
+      internals.buildOptionsBar()
+      const color = document.querySelector('.options-bar input[type=color]')
+      const colorCs = color ? getComputedStyle(color) : null
+      return {
+        rangeOk,
+        rangeAppearance,
+        rangeHeight,
+        colorOk: Boolean(color),
+        colorPadding: colorCs?.padding ?? '',
+        colorBorderWidth: colorCs?.borderTopWidth ?? '',
+        colorBorderColor: colorCs?.borderTopColor ?? '',
+      }
+    },
+
+    /** 输入框样式探针：选项栏里的数字输入必须用统一令牌，且没有原生上下箭头。 */
+    async inputStyleProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(200, 150))
+      app.tool = 'text'
+      ;(app as unknown as { buildOptionsBar(): void }).buildOptionsBar()
+
+      const input = document.querySelector('.options-bar input[type=number]')
+      if (!(input instanceof HTMLInputElement)) return { ok: false }
+      const cs = getComputedStyle(input)
+      return {
+        ok: true,
+        height: cs.height,
+        background: cs.backgroundColor,
+        borderColor: cs.borderTopColor,
+        appearance: cs.appearance,
+        fontFamily: cs.fontFamily,
+      }
+    },
+
+    /** 面板探针：文字选项栏不再有描边；图层面板底部有「图层效果」按钮。 */
+    async panelEffectsProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(200, 150))
+      const internals = app as unknown as {
+        buildOptionsBar(): void
+        layersPanel: { render(): void }
+      }
+
+      app.tool = 'text'
+      internals.buildOptionsBar()
+      const hasTextStroke = (document.getElementById('optionsBar')?.textContent ?? '').includes(
+        '描边',
+      )
+
+      app.tool = 'move'
+      internals.buildOptionsBar()
+      internals.layersPanel.render()
+      const footTitles = [...document.querySelectorAll('#layerActions button')].map(
+        (b) => b.getAttribute('title') ?? '',
+      )
+      return {
+        hasTextStroke,
+        hasEffectsBtn: footTitles.some((t) => t.includes('图层效果')),
+        footCount: footTitles.length,
+      }
+    },
+
+    /** 图层描边探针：外侧描边必须是**实色外扩**，不是发散的模糊。 */
+    async layerStrokeProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(160, 160))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+
+      // 60×60 纯白方块
+      const size = 60
+      const image = new ImageData(size, size)
+      for (let i = 0; i < image.data.length; i += 4) {
+        image.data[i] = 255
+        image.data[i + 1] = 255
+        image.data[i + 2] = 255
+        image.data[i + 3] = 255
+      }
+      const layer = app.editor.addImageLayer('方块', image)
+
+      const measure = (): { stroke: number; opaque: number } => {
+        app.renderFrame()
+        const img = app.readScreen()
+        let stroke = 0
+        let opaque = 0
+        for (let i = 0; i < img.data.length; i += 4) {
+          const a = img.data[i + 3]!
+          // 描边是纯红：红通道高、绿蓝低
+          if (a > 0 && img.data[i]! > 150 && img.data[i + 1]! < 90 && img.data[i + 2]! < 90) {
+            stroke++
+            if (a >= 250) opaque++
+          }
+        }
+        return { stroke, opaque }
+      }
+
+      const before = measure()
+
+      app.editor.edit('加描边', () => {
+        layer.effects = {
+          stroke: { enabled: true, size: 6, inside: false, color: [1, 0, 0], opacity: 1 },
+        }
+      })
+
+      const after = measure()
+      return {
+        beforeStroke: before.stroke,
+        strokePixels: after.stroke,
+        // 实色外扩时绝大多数描边像素应完全不透明；发散模糊会把这个占比拉低
+        opaqueRatio: after.stroke > 0 ? Number((after.opaque / after.stroke).toFixed(3)) : 0,
+      }
+    },
+
+    /** 选择同步探针：选一次字体，选择器应立刻显示新字体（不能要选两次）。 */
+    async fontPickSyncProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      app.tool = 'text'
+      const internals = app as unknown as {
+        buildOptionsBar(): void
+        currentTextMeta(): TextStyle
+      }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [20, 20])
+      internals.buildOptionsBar()
+
+      const btn = (): HTMLElement | null =>
+        document.querySelector('.font-picker-btn') as HTMLElement | null
+      const before = btn()?.textContent ?? ''
+      btn()?.click()
+      const rows = [...document.querySelectorAll('.font-picker-row')] as HTMLElement[]
+      // 挑一个跟当前不同的
+      const target = rows.find((r) => (r.textContent ?? '') !== before)
+      if (!target) return { ok: false, reason: '没有可选的其它字体', before }
+      const picked = target.textContent ?? ''
+      target.click()
+
+      // 选择会触发选项栏重建，所以这里重新取按钮
+      const after = btn()?.textContent ?? ''
+      return {
+        ok: true,
+        before,
+        picked,
+        after,
+        layerFont: layer.text?.fontName ?? '',
+        synced: after === picked,
+      }
+    },
+
+    /** 字体选择器探针：按钮与每个列表项都必须用各自的字体渲染。 */
+    async fontFieldProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      app.tool = 'text'
+      const internals = app as unknown as { buildOptionsBar(): void }
+      internals.buildOptionsBar()
+
+      const btn = document.querySelector('.font-picker-btn')
+      if (!(btn instanceof HTMLElement)) return { ok: false }
+      const beforeText = btn.textContent ?? ''
+      const beforeFamily = btn.style.fontFamily
+      btn.click()
+
+      const panel = document.querySelector('.font-picker-panel')
+      const rows = [...document.querySelectorAll('.font-picker-row')] as HTMLElement[]
+      const sample = rows
+        .slice(0, 3)
+        .map((r) => `${r.textContent ?? ''} → ${r.style.fontFamily}`)
+      // 各行的 font-family 必须互不相同 —— 这才是「每项用各自字体渲染」的证据。
+      // 只检查属性被设上是不够的（原生 select 就是这样骗过上一版探针的）。
+      const distinct = new Set(rows.map((r) => r.style.fontFamily)).size
+      return {
+        ok: true,
+        beforeText,
+        beforeFamily,
+        rowCount: rows.length,
+        distinct,
+        open: panel ? !panel.hasAttribute('hidden') : false,
+        sample,
+      }
+    },
+
+    /** 字体可用性探针：找出「能被选中、但选了其实不生效」的字体。 */
+    async fontUsabilityProbe(): Promise<Record<string, unknown>> {
+      // 用**过滤后**的列表（下拉框里实际显示的那些），而不是系统原始列表 ——
+      // 要验证的是「用户能选到的每一项都真的生效」。
+      const internals = app as unknown as { systemFonts?: string[] }
+      const fonts =
+        internals.systemFonts && internals.systemFonts.length > 0
+          ? internals.systemFonts
+          : ((await window.compositor.listFonts()) as string[])
+      const probe = new OffscreenCanvas(1, 1).getContext('2d')!
+      const missing = '__no_such_family__'
+      const text = '漢字ABCxyz'
+      // 统一回退链：基准与被测项必须用同一条链（"被测族, 不存在的族, sans-serif"）；
+      // 否则两者落到不同回退字体上，宽度天然不同，会把有效字体误判成无效。
+      const widthOf = (family: string): number => {
+        probe.font = `48px "${family}", "${missing}", sans-serif`
+        return Math.round(probe.measureText(text).width * 100) / 100
+      }
+      const baseline = widthOf(missing)
+
+      const sample = fonts
+      const rows = sample.map((f) => ({
+        font: f,
+        width: widthOf(f),
+        // 宽度与「不存在的族」相同 → 说明这个字体名根本没被解析，浏览器回退了
+        ineffective: widthOf(f) === baseline,
+      }))
+      return {
+        baseline,
+        total: fonts.length,
+        ineffectiveCount: rows.filter((r) => r.ineffective).length,
+        rows,
+      }
+    },
+
+    /** 字体替换探针：存在局部字体 run 时改整层字体，必须全部换掉、不留下旧字体的字。 */
+    async fontReplaceProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      const internals = app as unknown as {
+        currentTextMeta(): TextStyle
+        openTextEditor(id: string, all?: boolean): void
+        updateTextStyle(patch: Record<string, unknown>): void
+      }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [20, 20])
+      internals.openTextEditor(layer.id, true)
+
+      const ta = document.querySelector('.text-editor')
+      if (ta instanceof HTMLTextAreaElement) {
+        ta.value = 'ABCD'
+        ta.dispatchEvent(new Event('input'))
+        // 光标收起（无选区）→ 改样式应作用于整层
+        ta.setSelectionRange(2, 2)
+      }
+
+      // 先给中间两个字设一个局部字体 run
+      app.editor.applyText(
+        layer.id,
+        (t) => {
+          t.fontRuns = [{ location: 1, length: 2, fontName: 'SimSun' }]
+        },
+        '测试用局部字体',
+      )
+      const before = {
+        fontName: layer.text?.fontName,
+        runs: layer.text?.fontRuns?.length ?? 0,
+      }
+
+      internals.updateTextStyle({ fontName: 'KaiTi' })
+
+      return {
+        before,
+        after: {
+          fontName: layer.text?.fontName,
+          runs: layer.text?.fontRuns?.length ?? 0,
+        },
+      }
+    },
+
+    /** 版本号压力探针：连续改 20 次，每次屏幕都必须变（抓「改了没反应」这类间歇问题）。 */
+    async versionStressProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+      const internals = app as unknown as { currentTextMeta(): TextStyle }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [30, 30])
+
+      const countWhite = (): number => {
+        app.renderFrame()
+        const img = app.readScreen()
+        let n = 0
+        for (let i = 0; i < img.data.length; i += 4) {
+          if (img.data[i]! > 200 && img.data[i + 1]! > 200 && img.data[i + 2]! > 200) n++
+        }
+        return n
+      }
+
+      const samples: number[] = []
+      let stuck = 0
+      for (let i = 0; i < 20; i++) {
+        // 用「同样文字、交替字号」制造确定性变化：内容不会超出文档边界被裁，
+        // 所以每一轮屏幕像素数都必然不同 —— 任何一次相同就说明渲染没跟上。
+        const size = i % 2 === 0 ? 40 : 20
+        app.editor.previewText(layer.id, (t) => {
+          t.content = 'AAAA'
+          t.fontSize = size
+          // 显式设成白色：前面的探针可能改过 textStyle 的颜色并留在状态里，
+          // 不写死的话「数白色像素」就会恒为 0，误报成渲染没跟上。
+          t.red = 1
+          t.green = 1
+          t.blue = 1
+        })
+        const n = countWhite()
+        if (samples.length > 0 && n === samples[samples.length - 1]) stuck++
+        samples.push(n)
+      }
+      return {
+        distinct: new Set(samples).size,
+        stuck,
+        rounds: samples.length,
+      }
+    },
+
+    /** 描边探针：必须沿字形外缘向外扩一层**实色**（不是发散的模糊）。 */
+    async textStrokeProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      const internals = app as unknown as { currentTextMeta(): TextStyle }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [30, 30])
+
+      app.editor.previewText(layer.id, (t) => {
+        t.content = 'AA'
+      })
+      const plain = [...layer.transform.size]
+
+      app.editor.previewText(layer.id, (t) => {
+        t.textStroke = { width: 4, red: 1, green: 0, blue: 0 }
+      })
+      const stroked = [...layer.transform.size]
+
+      const px = app.editor.pixelStore.get(layer.id)
+      let redPixels = 0
+      let redOpaque = 0
+      let alphaSum = 0
+      if (px) {
+        const ctx = px.canvas.getContext('2d')!
+        const img = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+        for (let i = 0; i < img.data.length; i += 4) {
+          const a = img.data[i + 3]!
+          if (a > 0 && img.data[i]! > 200 && img.data[i + 1]! < 60 && img.data[i + 2]! < 60) {
+            redPixels++
+            if (a >= 250) redOpaque++
+            alphaSum += a / 255
+          }
+        }
+      }
+      return {
+        plain,
+        stroked,
+        redPixels,
+        redOpaque,
+        // 实色外扩：绝大多数描边像素应当是完全不透明的（只有字形边缘带抗锯齿）。
+        // 发散模糊会让这个占比很低。
+        opaqueRatio: redPixels > 0 ? Number((redOpaque / redPixels).toFixed(3)) : 0,
+        redAvgAlpha: redPixels > 0 ? Number((alphaSum / redPixels).toFixed(3)) : 0,
+      }
+    },
+
+    /** 选区样式探针：选中一部分文字后改字体，应当只写进 fontRuns 而不动整层。 */
+    async rangeStyleProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+      const internals = app as unknown as {
+        currentTextMeta(): TextStyle
+        openTextEditor(id: string, all?: boolean): void
+        updateTextStyle(patch: Record<string, unknown>): void
+      }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [20, 20])
+      internals.openTextEditor(layer.id, true)
+
+      const ta = document.querySelector('.text-editor')
+      if (!(ta instanceof HTMLTextAreaElement)) return { ok: false }
+      ta.value = '你好世界'
+      ta.dispatchEvent(new Event('input'))
+
+      // 只选中中间两个字
+      ta.setSelectionRange(1, 3)
+      const before = { fontName: layer.text?.fontName, runs: layer.text?.fontRuns?.length ?? 0 }
+      internals.updateTextStyle({ fontName: 'SimSun' })
+      const after = {
+        fontName: layer.text?.fontName,
+        runs: layer.text?.fontRuns?.length ?? 0,
+        run: layer.text?.fontRuns?.[0] ?? null,
+      }
+      return { ok: true, before, after, editorOpen: Boolean(document.querySelector('.text-editor')) }
+    },
+
+    /** 富文本探针：局部换字体 / 换字号 / 换颜色是否真的生效。 */
+    async richTextProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      const internals = app as unknown as { currentTextMeta(): TextStyle }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [20, 20])
+
+      app.editor.previewText(layer.id, (t) => {
+        t.content = 'AAAA'
+      })
+      const plain = [...layer.transform.size]
+
+      // 前两个字换字体
+      app.editor.previewText(layer.id, (t) => {
+        t.fontRuns = [{ location: 0, length: 2, fontName: 'Courier New' }]
+      })
+      const mixedFont = [...layer.transform.size]
+
+      // 前两个字字号加倍
+      app.editor.previewText(layer.id, (t) => {
+        t.sizeRuns = [{ location: 0, length: 2, fontSize: 96 }]
+        })
+      const bigSize = [...layer.transform.size]
+
+      // 前两个字变红，然后数画布上的纯红像素
+      app.editor.previewText(layer.id, (t) => {
+        t.colorRuns = [{ location: 0, length: 2, red: 1, green: 0, blue: 0 }]
+      })
+      const px = app.editor.pixelStore.get(layer.id)
+      let redPixels = -1
+      if (px) {
+        const ctx = px.canvas.getContext('2d')!
+        const img = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+        redPixels = 0
+        for (let i = 0; i < img.data.length; i += 4) {
+          if (img.data[i]! > 200 && img.data[i + 1]! < 60 && img.data[i + 2]! < 60) redPixels++
+        }
+      }
+
+      const t = layer.text
+      return {
+        plain,
+        mixedFont,
+        bigSize,
+        redPixels,
+        fontRunCount: t?.fontRuns?.length ?? 0,
+        colorRunCount: t?.colorRuns?.length ?? 0,
+        sizeRunCount: t?.sizeRuns?.length ?? 0,
+      }
+    },
+
+    /** 准备一个已填内容的编辑框，返回可供真实鼠标点击的坐标。 */
+    async textCaretProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+      const internals = app as unknown as {
+        currentTextMeta(): TextStyle
+        openTextEditor(id: string, all?: boolean): void
+      }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [40, 40])
+      internals.openTextEditor(layer.id, true)
+
+      const ta = document.querySelector('.text-editor')
+      if (!(ta instanceof HTMLTextAreaElement)) return { ok: false }
+      ta.value = '你好世界'
+      ta.dispatchEvent(new Event('input'))
+      const box = ta.getBoundingClientRect()
+      return {
+        ok: true,
+        x: Math.round(box.left + 30),
+        y: Math.round(box.top + box.height / 2),
+        length: ta.value.length,
+        before: ta.selectionStart,
+      }
+    },
+
+    /** 编辑框当前的光标位置。 */
+    async textCaretState(): Promise<Record<string, unknown>> {
+      const ta = document.querySelector('.text-editor')
+      if (!(ta instanceof HTMLTextAreaElement)) return { ok: false }
+      return {
+        ok: true,
+        selectionStart: ta.selectionStart,
+        selectionEnd: ta.selectionEnd,
+        length: ta.value.length,
+        focused: document.activeElement === ta,
+      }
+    },
+
+    /** 文字显示探针：输入文字后屏幕上必须真的出现文字像素，第二次修改也必须生效。 */
+    async textRenderProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+      const internals = app as unknown as { currentTextMeta(): TextStyle }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [60, 60])
+
+      const countWhite = (): number => {
+        app.renderFrame()
+        const img = app.readScreen()
+        let n = 0
+        for (let i = 0; i < img.data.length; i += 4) {
+          if (img.data[i]! > 200 && img.data[i + 1]! > 200 && img.data[i + 2]! > 200) n++
+        }
+        return n
+      }
+
+      const empty = countWhite()
+      app.editor.previewText(layer.id, (t) => {
+        t.content = '大家'
+      })
+      const once = countWhite()
+      // 再改一次：这一步专门抓「改了没反应」（纹理被版本号碰撞跳过更新）
+      app.editor.previewText(layer.id, (t) => {
+        t.content = '大家好呀'
+      })
+      const twice = countWhite()
+      return { empty, once, twice }
+    },
+
+    /** 准备文字工具并返回画布上某点的客户端坐标（供真实鼠标事件使用）。 */
+    async prepareTextTool(): Promise<{ x: number; y: number }> {
+      // 先收掉可能还开着的编辑框：它盖在画布上会吃掉真实点击
+      ;(app as unknown as { closeTextEditor(commit: boolean): void }).closeTextEditor(false)
+      app.editor.replaceDocument(createDocument(400, 300))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+      app.tool = 'text'
+      const rect = need('canvasHost').getBoundingClientRect()
+      return {
+        x: Math.round(rect.left + app.view.panX + 100 * app.view.zoom),
+        y: Math.round(rect.top + app.view.panY + 100 * app.view.zoom),
+      }
+    },
+
+    /** 当前内联编辑器的状态（供真实鼠标事件后检查）。 */
+    async textEditorState(): Promise<Record<string, unknown>> {
+      const ta = document.querySelector('.text-editor')
+      if (!(ta instanceof HTMLTextAreaElement)) {
+        return { exists: false, layers: app.editor.manifest.layers.length }
+      }
+      const cs = getComputedStyle(ta)
+      return {
+        exists: true,
+        width: Math.round(ta.getBoundingClientRect().width),
+        textColor: cs.color,
+        focused: document.activeElement === ta,
+        layers: app.editor.manifest.layers.length,
+      }
+    },
+
+    /** 文字编辑器探针：走完整流程（文字工具 → 点画布），检查编辑框真的可用。 */
+    async textEditorProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+      app.tool = 'text'
+
+      const host = need('canvasHost')
+      const rect = host.getBoundingClientRect()
+      const cx = rect.left + app.view.panX + 100 * app.view.zoom
+      const cy = rect.top + app.view.panY + 100 * app.view.zoom
+
+      const internals = app as unknown as {
+        onPointerDown(ev: PointerEvent): void
+        onPointerUp(ev: PointerEvent): void
+      }
+      const down = new PointerEvent('pointerdown', {
+        clientX: cx,
+        clientY: cy,
+        bubbles: true,
+        cancelable: true,
+        pointerId: 1,
+      })
+      internals.onPointerDown(down)
+      internals.onPointerUp(
+        new PointerEvent('pointerup', { clientX: cx, clientY: cy, bubbles: true, pointerId: 1 }),
+      )
+      // 等两帧：编辑框的聚焦被刻意延后到下一帧，真实点击才不会被抢走焦点
+      await new Promise<void>((resolve) => {
+        window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()))
+      })
+
+      const ta = document.querySelector('.text-editor')
+      if (!(ta instanceof HTMLTextAreaElement)) {
+        return {
+          exists: false,
+          width: 0,
+          textColor: '',
+          caretColor: '',
+          focused: false,
+          prevented: down.defaultPrevented,
+        }
+      }
+      const cs = getComputedStyle(ta)
+      const box = ta.getBoundingClientRect()
+      return {
+        exists: true,
+        width: Math.round(box.width),
+        height: Math.round(box.height),
+        textColor: cs.color,
+        caretColor: cs.caretColor,
+        focused: document.activeElement === ta,
+        prevented: down.defaultPrevented,
+        layerCount: app.editor.manifest.layers.length,
+      }
+    },
+
+    /** 新建文字探针：点空白新建时不该显示任何字，输入后才出现内容。 */
+    async textNewProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      const internals = app as unknown as { currentTextMeta(): TextStyle }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [50, 50])
+
+      const stat = (): { canvas: string; opaque: number } => {
+        const px = app.editor.pixelStore.get(layer.id)
+        if (!px) return { canvas: '无', opaque: -1 }
+        const ctx = px.canvas.getContext('2d')!
+        const img = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+        let n = 0
+        for (let i = 3; i < img.data.length; i += 4) if (img.data[i]! > 0) n++
+        return { canvas: `${px.canvas.width}×${px.canvas.height}`, opaque: n }
+      }
+
+      const empty = stat()
+      app.editor.previewText(layer.id, (t) => {
+        t.content = '大家好'
+      })
+      const typed = stat()
+      return {
+        emptyCanvas: empty.canvas,
+        emptyOpaque: empty.opaque,
+        typedContent: layer.text?.content ?? '',
+        typedCanvas: typed.canvas,
+        typedOpaque: typed.opaque,
+      }
+    },
+
+    /**
+     * 文字包围盒探针：检查文字实际画出来的范围与图层画布 / transform.size 是否吻合。
+     * 三者不一致就会出现「文字与框位置不对」或文字被裁掉。
+     */
+    async textBoundsProbe(): Promise<{
+      size: number[]
+      canvas: number[]
+      bbox: number[]
+      clipped: boolean
+    }> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      const layer = app.editor.addTextLayer(
+        '测试文字 Abc',
+        (app as unknown as { currentTextMeta(): TextStyle }).currentTextMeta(),
+        [50, 50],
+      )
+      const px = app.editor.pixelStore.get(layer.id)
+      if (!px) throw new Error('文字图层没有像素')
+      const ctx = px.canvas.getContext('2d')!
+      const img = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+
+      let minX = px.canvas.width
+      let minY = px.canvas.height
+      let maxX = -1
+      let maxY = -1
+      for (let y = 0; y < px.canvas.height; y++) {
+        for (let x = 0; x < px.canvas.width; x++) {
+          if (img.data[(y * px.canvas.width + x) * 4 + 3]! > 0) {
+            if (x < minX) minX = x
+            if (y < minY) minY = y
+            if (x > maxX) maxX = x
+            if (y > maxY) maxY = y
+          }
+        }
+      }
+      const bbox = maxX < 0 ? [0, 0, 0, 0] : [minX, minY, maxX - minX + 1, maxY - minY + 1]
+      // 贴到画布边缘就说明被裁了
+      const clipped = maxX >= px.canvas.width - 1 || maxY >= px.canvas.height - 1
+      return {
+        size: [...layer.transform.size],
+        canvas: [px.canvas.width, px.canvas.height],
+        bbox,
+        clipped,
+      }
+    },
+
+    /**
+     * 框与图片对位探针：导入一张纯红图片，渲染后读**屏幕像素**，
+     * 比较红色区域的实际包围盒与变换框应有的屏幕矩形。
+     * 两者不重合就说明渲染位置与 transform 脱节了。
+     */
+    async frameVsImageProbe(): Promise<{
+      imageBBox: number[]
+      frameRect: number[]
+      dx: number
+      dy: number
+      matches: boolean
+    }> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+
+      const c = new OffscreenCanvas(80, 60)
+      const cx = c.getContext('2d')
+      if (!cx) throw new Error('缺少 2D 上下文')
+      cx.fillStyle = '#ff0000'
+      cx.fillRect(0, 0, 80, 60)
+      const blob = await c.convertToBlob({ type: 'image/png' })
+      const bytes = new Uint8Array(await blob.arrayBuffer())
+      await (
+        app as unknown as { importImageBytes(n: string, b: Uint8Array): Promise<void> }
+      ).importImageBytes('红图.png', bytes)
+
+      const layer = app.editor.activeLayer!
+      app.tool = 'move'
+      app.renderFrame()
+      const screen = app.readScreen()
+
+      let minX = screen.width
+      let minY = screen.height
+      let maxX = -1
+      let maxY = -1
+      for (let y = 0; y < screen.height; y++) {
+        for (let x = 0; x < screen.width; x++) {
+          const i = (y * screen.width + x) * 4
+          if (screen.data[i]! > 180 && screen.data[i + 1]! < 80 && screen.data[i + 2]! < 80) {
+            if (x < minX) minX = x
+            if (y < minY) minY = y
+            if (x > maxX) maxX = x
+            if (y > maxY) maxY = y
+          }
+        }
+      }
+      const imageBBox = maxX < 0 ? [0, 0, 0, 0] : [minX, minY, maxX - minX + 1, maxY - minY + 1]
+
+      const dpr = window.devicePixelRatio || 1
+      const z = app.view.zoom * dpr
+      const t = layer.transform
+      const frameRect = [
+        app.view.panX * dpr + t.origin[0] * z,
+        app.view.panY * dpr + t.origin[1] * z,
+        t.size[0] * z,
+        t.size[1] * z,
+      ]
+
+      const dx = Math.abs((imageBBox[0] ?? 0) - (frameRect[0] ?? 0))
+      const dy = Math.abs((imageBBox[1] ?? 0) - (frameRect[1] ?? 0))
+      // 框线本身会盖住最外一圈像素，容差 3px
+      return { imageBBox, frameRect, dx, dy, matches: dx <= 3 && dy <= 3 }
+    },
+
+    /**
+     * 自动选择探针：复现「上层是文档尺寸的空白图层、下层才是图片」的情形，
+     * 点图片应当选中图片图层，点空白处不应选中任何图层。
+     */
+    async autoSelectProbe(): Promise<{
+      picked: string | null
+      blankOnTop: boolean
+      missIsNull: boolean
+      ok: boolean
+    }> {
+      app.editor.replaceDocument(createDocument(200, 150))
+
+      const c = new OffscreenCanvas(60, 40)
+      const cx = c.getContext('2d')
+      if (!cx) throw new Error('缺少 2D 上下文')
+      cx.fillStyle = '#ff0000'
+      cx.fillRect(0, 0, 60, 40)
+      const blob = await c.convertToBlob({ type: 'image/png' })
+      const bytes = new Uint8Array(await blob.arrayBuffer())
+      await (
+        app as unknown as { importImageBytes(n: string, b: Uint8Array): Promise<void> }
+      ).importImageBytes('红图.png', bytes)
+      const img = app.editor.activeLayer!
+      app.editor.setTransform(img.id, { origin: [20, 20], size: [60, 40] })
+
+      // 上层再放一个文档尺寸的空白图层，并把选择切到它上面
+      const blank = app.editor.addLayer('空白层')
+      app.editor.select(blank.id)
+
+      const internals = app as unknown as {
+        layerAtDoc(x: number, y: number): { id: string; name: string } | null
+      }
+      // (40,40) 落在图片上；(180,140) 是空白处
+      const hit = internals.layerAtDoc(40, 40)
+      const miss = internals.layerAtDoc(180, 140)
+
+      return {
+        picked: hit?.name ?? null,
+        blankOnTop: app.editor.manifest.layers.indexOf(blank) > app.editor.manifest.layers.indexOf(img),
+        missIsNull: miss === null,
+        ok: hit?.id === img.id && miss === null,
+      }
+    },
+
+    /**
+     * 用户流程探针：完整走一遍「拖入图片 → 建选区 → Ctrl+J」，
+     * 然后从画布上到下采样颜色序列，检查副本是否被上下颠倒。
+     * 图片做成「上红 / 中绿 / 下蓝」，一眼就能看出方向。
+     */
+    async userFlowProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+
+      const c = new OffscreenCanvas(120, 80)
+      const cx = c.getContext('2d')
+      if (!cx) throw new Error('缺少 2D 上下文')
+      cx.fillStyle = '#ff0000'
+      cx.fillRect(0, 0, 120, 26)
+      cx.fillStyle = '#00ff00'
+      cx.fillRect(0, 26, 120, 27)
+      cx.fillStyle = '#0000ff'
+      cx.fillRect(0, 53, 120, 27)
+      const blob = await c.convertToBlob({ type: 'image/png' })
+      const bytes = new Uint8Array(await blob.arrayBuffer())
+
+      // 1) 拖入
+      const dt = new DataTransfer()
+      dt.items.add(new File([bytes], '流程.png', { type: 'image/png' }))
+      window.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }))
+      await new Promise((resolve) => setTimeout(resolve, 400))
+
+      const src = app.editor.activeLayer!
+      const doc = app.editor.manifest
+
+      // 2) 画一个覆盖左半边的选区
+      const mask = new Uint8ClampedArray(doc.width * doc.height)
+      for (let y = 0; y < doc.height; y++) {
+        for (let x = 0; x < doc.width / 2; x++) mask[y * doc.width + x] = 255
+      }
+      app.selectionMask = mask
+
+      // 3) Ctrl+J
+      ;(app as unknown as { copyToNewLayer(): void }).copyToNewLayer()
+
+      const copy = app.editor.manifest.layers.find((l) => l.id !== src.id)
+
+      /** 从上到下采样三个点，返回颜色标签。 */
+      const column = (id: string): string[] => {
+        const px = app.editor.pixelStore.get(id)
+        if (!px) return ['无像素']
+        const ctx = px.canvas.getContext('2d')!
+        const img = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+        const labels: string[] = []
+        for (const frac of [0.15, 0.5, 0.85]) {
+          const y = Math.floor(px.canvas.height * frac)
+          const i = (y * px.canvas.width + 30) * 4
+          const r = img.data[i]!
+          const g = img.data[i + 1]!
+          const b = img.data[i + 2]!
+          const a = img.data[i + 3]!
+          labels.push(a === 0 ? '透明' : r > 180 ? '红' : b > 180 ? '蓝' : g > 180 ? '绿' : `${r},${g},${b}`)
+        }
+        return labels
+      }
+
+      return {
+        srcTransform: `${JSON.stringify(src.transform.origin)} / ${JSON.stringify(src.transform.size)} flipY=${src.transform.flipY}`,
+        copyTransform: copy
+          ? `${JSON.stringify(copy.transform.origin)} / ${JSON.stringify(copy.transform.size)} flipY=${copy.transform.flipY}`
+          : '（没有副本）',
+        srcColumn: column(src.id),
+        copyColumn: copy ? column(copy.id) : [],
+        srcCanvas: (() => {
+          const px = app.editor.pixelStore.get(src.id)
+          return px ? `${px.canvas.width}×${px.canvas.height}` : '无'
+        })(),
+        copyCanvas: (() => {
+          const px = copy ? app.editor.pixelStore.get(copy.id) : null
+          return px ? `${px.canvas.width}×${px.canvas.height}` : '无'
+        })(),
+      }
+    },
+
+    /**
+     * 无选区 JPEG 复制探针：完整对应「拖入 jpg → 直接 Ctrl+J」这条路径。
+     * 除了比对副本画布像素，还读**屏幕**像素比对，因为用户看到的是屏幕。
+     */
+    async jpegCopyProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(1280, 800))
+      // 必须重新适配视图：否则会沿用上一个文档的缩放/平移，
+      // 采样坐标全错（这正是之前方向探针漏报的原因）
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+
+      // 造一张 959×702 的 JPEG（上红/中绿/下蓝），尺寸与用户的一致
+      const c = new OffscreenCanvas(959, 702)
+      const cx = c.getContext('2d')
+      if (!cx) throw new Error('缺少 2D 上下文')
+      cx.fillStyle = '#ff0000'
+      cx.fillRect(0, 0, 959, 234)
+      cx.fillStyle = '#00ff00'
+      cx.fillRect(0, 234, 959, 234)
+      cx.fillStyle = '#0000ff'
+      cx.fillRect(0, 468, 959, 234)
+      const blob = await c.convertToBlob({ type: 'image/jpeg', quality: 0.92 })
+      const bytes = new Uint8Array(await blob.arrayBuffer())
+
+      await (
+        app as unknown as { importImageBytes(n: string, b: Uint8Array): Promise<void> }
+      ).importImageBytes('测试.jpg', bytes)
+      const src = app.editor.activeLayer!
+
+      app.selectionMask = null
+      ;(app as unknown as { copyToNewLayer(): void }).copyToNewLayer()
+      const copy = app.editor.manifest.layers.find((l) => l.id !== src.id)!
+
+      const column = (id: string): string[] => {
+        const px = app.editor.pixelStore.get(id)
+        if (!px) return ['无像素']
+        const ctx = px.canvas.getContext('2d')!
+        const img = ctx.getImageData(0, 0, px.canvas.width, px.canvas.height)
+        const out: string[] = []
+        for (const fy of [0.1, 0.5, 0.9]) {
+          const x = Math.floor(px.canvas.width * 0.5)
+          const y = Math.floor(px.canvas.height * fy)
+          const i = (y * px.canvas.width + x) * 4
+          const r = img.data[i]!
+          const g = img.data[i + 1]!
+          const b = img.data[i + 2]!
+          out.push(r > 180 ? '红' : b > 180 ? '蓝' : g > 180 ? '绿' : `${r},${g},${b}`)
+        }
+        return out
+      }
+
+      // 屏幕：沿文档中心竖线自顶向下采 10 点，看清整列的分布
+      app.renderFrame()
+      const screen = app.readScreen()
+      const dpr = window.devicePixelRatio || 1
+      const z = app.view.zoom * dpr
+      const screenCol = Array.from({ length: 10 }, (_, i) => {
+        const fy = (i + 0.5) / 10
+        const x = Math.round(app.view.panX * dpr + 1280 * 0.5 * z)
+        const y = Math.round(app.view.panY * dpr + 800 * fy * z)
+        if (x < 0 || y < 0 || x >= screen.width || y >= screen.height) return '越界'
+        const j = (y * screen.width + x) * 4
+        const r = screen.data[j]!
+        const g = screen.data[j + 1]!
+        const b = screen.data[j + 2]!
+        return r > 180 ? '红' : b > 180 ? '蓝' : g > 180 ? '绿' : `${r},${g},${b}`
+      })
+
+      return {
+        srcTransform: `o=${JSON.stringify(src.transform.origin)} s=${JSON.stringify(src.transform.size)}`,
+        copyTransform: `o=${JSON.stringify(copy.transform.origin)} s=${JSON.stringify(copy.transform.size)}`,
+        srcCanvasCol: column(src.id),
+        copyCanvasCol: column(copy.id),
+        screenCol,
+        samePosition: JSON.stringify(src.transform.origin) === JSON.stringify(copy.transform.origin),
+      }
     },
   }
 } catch (err) {

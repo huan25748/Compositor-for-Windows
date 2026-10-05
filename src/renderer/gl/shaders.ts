@@ -128,7 +128,10 @@ in vec2 aPos;              // 单位四边形 0..1
 out vec2 vUV;
 void main() {
   vUV = aPos;
-  gl_Position = vec4(aPos.x * 2.0 - 1.0, 1.0 - aPos.y * 2.0, 0.0, 1.0);
+  // 关键：渲染到 FBO 时，vUV.y=0 必须落在 framebuffer 的 texel 行 0（也就是纹理 v=0），
+  // 才能让「文档顶部」与「纹理 v=0」对应上。这里若把 y 翻转，
+  // 合成结果在纹理里就是上下倒的，最终整幅画面都会被翻过来。
+  gl_Position = vec4(aPos.x * 2.0 - 1.0, aPos.y * 2.0 - 1.0, 0.0, 1.0);
 }
 `
 
@@ -320,6 +323,27 @@ void main() {
 // ——————————————————————————————————————————————————————————————
 
 /** 可分离高斯模糊（只取 alpha 通道，用于生成柔化覆盖）。 */
+export const DILATE_FS = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 fragColor;
+uniform sampler2D uSrc;
+uniform vec2 uStep;      // 方向步长（1/宽 或 1/高）
+uniform float uRadius;   // 膨胀半径（像素）
+void main() {
+  // 形态学膨胀：取该方向 ±uRadius 内的**最大** alpha。
+  // 与「模糊 + 阈值化」不同，它不会把边缘摊成渐变，结果就是实色的外扩 ——
+  // 这正是描边应有的样子（模糊方案看起来是发虚的）。
+  const int N = 32;
+  float m = 0.0;
+  for (int i = -N; i <= N; i++) {
+    float t = float(i) / float(N);
+    m = max(m, texture(uSrc, vUV + uStep * uRadius * t).r);
+  }
+  fragColor = vec4(m);
+}
+`
+
 export const BLUR_FS = /* glsl */ `#version 300 es
 precision highp float;
 in vec2 vUV;
@@ -486,6 +510,40 @@ void main() {
 
 /** 最多同时显示的参考线条数（MVP 上限；官方数据可存 1000 条）。 */
 export const MAX_VISIBLE_GUIDES = 16
+
+/**
+ * 变换框与四角手柄（移动工具下显示，拖动即可调整图层大小）。
+ */
+export const TRANSFORM_FS = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 fragColor;
+uniform vec4 uRect;      // 图层在屏幕上的矩形
+uniform float uHandle;   // 手柄边长（屏幕像素）
+void main() {
+  vec2 p = uRect.xy + vUV * uRect.zw;
+  // 注意：half 是 GLSL ES 的保留字，不能用作变量名
+  vec2 halfSize = uRect.zw * 0.5;
+  vec2 c = uRect.xy + halfSize;
+  vec2 d = abs(p - c) - halfSize;
+
+  float h = max(uHandle * 0.5, 3.0);
+  bool onHandle =
+    (abs(p.x - uRect.x) <= h || abs(p.x - (uRect.x + uRect.z)) <= h) &&
+    (abs(p.y - uRect.y) <= h || abs(p.y - (uRect.y + uRect.w)) <= h);
+  if (onHandle) {
+    fragColor = vec4(1.0, 1.0, 1.0, 1.0);
+    return;
+  }
+
+  float border = max(d.x, d.y);
+  if (abs(border) < 1.0) {
+    fragColor = vec4(1.0, 1.0, 1.0, 0.8);
+    return;
+  }
+  discard;
+}
+`
 
 /**
  * 画布辅助：网格、像素网格与参考线。

@@ -42,6 +42,7 @@ function buildMenu(): void {
         { label: '导入图像…', accelerator: 'CmdOrCtrl+Shift+I', click: () => send('file.import') },
         { label: '导出 PNG…', accelerator: 'CmdOrCtrl+Shift+E', click: () => send('file.exportPng') },
         { label: '导出 JPEG…', accelerator: 'CmdOrCtrl+Alt+Shift+E', click: () => send('file.exportJpeg') },
+        { label: '导出 PSD…', click: () => send('file.exportPsd') },
         { type: 'separator' },
         { label: '关闭项目', accelerator: 'CmdOrCtrl+W', click: () => send('file.close') },
         { label: '退出', role: 'quit' },
@@ -124,6 +125,7 @@ function buildMenu(): void {
       label: '帮助',
       submenu: [
         { label: '关于 Compositor for Windows', click: () => send('help.about') },
+        { label: '诊断信息（反馈问题时请附上）', click: () => send('help.diagnostics') },
         {
           label: '查看上游项目',
           click: () => void shell.openExternal('https://github.com/robbietilton/Compositor'),
@@ -201,13 +203,18 @@ function registerIPC(): void {
     return out
   })
 
-  // —— 导出位图 ——
+  // —— 导出位图 / PSD ——
   ipcMain.handle(
     'image:save',
-    async (_e, opts: { suggested: string; format: 'png' | 'jpeg'; bytes: Uint8Array }): Promise<string | null> => {
-      const ext = opts.format === 'png' ? 'png' : 'jpg'
+    async (
+      _e,
+      opts: { suggested: string; format: 'png' | 'jpeg' | 'psd'; bytes: Uint8Array },
+    ): Promise<string | null> => {
+      const ext = opts.format === 'png' ? 'png' : opts.format === 'psd' ? 'psd' : 'jpg'
+      const title =
+        opts.format === 'png' ? '导出 PNG' : opts.format === 'psd' ? '导出 PSD' : '导出 JPEG'
       const res = await dialog.showSaveDialog(mainWindow!, {
-        title: opts.format === 'png' ? '导出 PNG' : '导出 JPEG',
+        title,
         defaultPath: opts.suggested.endsWith(`.${ext}`) ? opts.suggested : `${opts.suggested}.${ext}`,
         filters: [{ name: opts.format.toUpperCase(), extensions: [ext] }],
         buttonLabel: '导出',
@@ -220,6 +227,38 @@ function registerIPC(): void {
 
   ipcMain.handle('shell:reveal', async (_e, path: string): Promise<void> => {
     shell.showItemInFolder(path)
+  })
+
+  // —— 枚举系统已安装字体（读注册表，能拿到人类可读的字体名）——
+  ipcMain.handle('fonts:list', async (): Promise<string[]> => {
+    try {
+      const { execFile } = await import('node:child_process')
+      // 走 PowerShell 的 InstalledFontCollection：它给出干净的字体族名（如 "Microsoft YaHei"），
+      // 并且包含「仅为我安装」的用户级字体 —— 只读 HKLM 会漏掉后者。
+      // 两点注意：
+      //   1. 必须显式把输出编码设成 UTF-8，否则中文系统上拿到的是 GBK 字节，列表会全是乱码。
+      //   2. 不要把注册表路径拼进脚本里，反斜杠在多层转义中极易被吃掉而静默返回空列表。
+      const script =
+        '[Console]::OutputEncoding=[Text.Encoding]::UTF8;' +
+        'Add-Type -AssemblyName System.Drawing;' +
+        '(New-Object System.Drawing.Text.InstalledFontCollection).Families | ForEach-Object { $_.Name }'
+      const stdout = await new Promise<string>((resolve) => {
+        execFile(
+          'powershell',
+          ['-NoProfile', '-NonInteractive', '-Command', script],
+          { maxBuffer: 4 * 1024 * 1024, windowsHide: true },
+          (err, out) => resolve(err ? '' : out),
+        )
+      })
+      const names = new Set<string>()
+      for (const raw of stdout.split(/\r?\n/)) {
+        const name = raw.replace(/^\uFEFF/, '').trim()
+        if (name && name.length <= 60) names.add(name)
+      }
+      return [...names].sort((a, b) => a.localeCompare(b))
+    } catch {
+      return []
+    }
   })
 
   ipcMain.handle('app:info', () => ({
@@ -266,6 +305,7 @@ function createWindow(): void {
     win.webContents.on('console-message', (event) => {
       const level = (event as unknown as { level?: string | number }).level
       const message = (event as unknown as { message?: string }).message
+      if (message) console.log(`[renderer:${String(level)}] ${message}`)
       const bad = level === 'error' || level === 'warning' || level === 3 || level === 2
       if (bad && message) errors.push(`[控制台] ${message}`)
     })
@@ -480,6 +520,653 @@ function createWindow(): void {
             for (const name of ['clone', 'heal', 'smudge', 'liquify']) {
               if ((rt[name] ?? 0) === 0) problems.push(`修图工具 ${name} 没有改动任何像素`)
             }
+
+            // —— 方向探针：屏幕上的图像不能上下颠倒 ——
+            const oriRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.orientationProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const ori = JSON.parse(oriRaw) as {
+              screenTop: number[]
+              screenBottom: number[]
+              compositeTop: number[]
+              compositeBottom: number[]
+              screenOriented: boolean
+              compositeOriented: boolean
+            }
+            console.log(
+              `[e2e] 方向探针：屏幕上半=${JSON.stringify(ori.screenTop)} 下半=${JSON.stringify(ori.screenBottom)}；` +
+                `合成上半=${JSON.stringify(ori.compositeTop)} 下半=${JSON.stringify(ori.compositeBottom)}`,
+            )
+            if (!ori.compositeOriented) problems.push('合成结果的文档坐标方向不对')
+            if (!ori.screenOriented) problems.push('屏幕显示上下颠倒')
+
+            // —— 复制图层探针：副本必须与原件逐字节一致 ——
+            const dupRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.duplicateProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const dup = JSON.parse(dupRaw) as {
+              identical: boolean
+              srcTop: number[]
+              copyTop: number[]
+              copyBottom: number[]
+              copyName: string
+            }
+            console.log(
+              `[e2e] 复制探针：副本名=${dup.copyName}，与原件一致=${dup.identical}，` +
+                `原件上=${JSON.stringify(dup.srcTop)} 副本上=${JSON.stringify(dup.copyTop)} 副本下=${JSON.stringify(dup.copyBottom)}`,
+            )
+            if (!dup.identical) problems.push('复制出的图层像素与原件不一致（翻转或错位）')
+            if (!(dup.copyTop[0]! > 180 && dup.copyBottom[2]! > 180)) {
+              problems.push('复制出的图层上下方向反了')
+            }
+
+            // —— 选区复制探针：只能复制选区内的像素 ——
+            const selCopyRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.selectionCopyProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const sc = JSON.parse(selCopyRaw) as {
+              copiedOpaque: number
+              copyName: string
+              copyCanvas: string
+              srcCanvas: string
+            }
+            console.log(
+              `[e2e] 选区复制探针：副本名=${sc.copyName}，复制到 ${sc.copiedOpaque} 个不透明像素（选区内应为 512）`,
+            )
+            console.log(
+              `[e2e] 选区复制探针：原件画布=${sc.srcCanvas}（整层 32×32），副本画布=${sc.copyCanvas}（应裁到选区 16×32）`,
+            )
+            if (sc.copiedOpaque !== 512) problems.push('Ctrl+J 没有按选区裁剪像素')
+            if (sc.copyCanvas === sc.srcCanvas) {
+              problems.push('Ctrl+J 没有把副本裁到选区内容大小（框会比内容大出一圈）')
+            }
+
+            // —— 缩放探针：抓角手柄后能改变图层尺寸 ——
+            const scaleRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.scaleProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const spx = JSON.parse(scaleRaw) as { hit: string | null; size: number[]; resized: boolean }
+            console.log(
+              `[e2e] 缩放探针：命中手柄=${spx.hit}，调整后尺寸=${JSON.stringify(spx.size)}，成功=${spx.resized}`,
+            )
+            if (spx.hit !== 'se') problems.push('没有命中右下角缩放手柄')
+            if (!spx.resized) problems.push('拖动角手柄没有改变图层尺寸')
+
+            // —— 导入流程探针（诊断输出，同时断言副本与原件变换一致）——
+            const flowRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.importFlowProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const flow = JSON.parse(flowRaw) as Record<string, Record<string, unknown>>
+            console.log(`[e2e] 导入流程：导入后=${JSON.stringify(flow['imported'])}`)
+            console.log(`[e2e] 导入流程：缩放后=${JSON.stringify(flow['afterScale'])}`)
+            console.log(`[e2e] 导入流程：复制后=${JSON.stringify(flow['copied'])}`)
+            const fCopied = flow['copied']!
+            const fScaled = flow['afterScale']!
+            if (JSON.stringify(fCopied['size']) !== JSON.stringify(fScaled['size'])) {
+              problems.push(
+                `复制出的图层尺寸与原图层不一致：原件 ${JSON.stringify(fScaled['size'])}，副本 ${JSON.stringify(fCopied['size'])}`,
+              )
+            }
+            if (JSON.stringify(fCopied['origin']) !== JSON.stringify(fScaled['origin'])) {
+              problems.push('复制出的图层位置与原图层不一致')
+            }
+
+            // —— 移动探针：吸附不应把图层挪出预期位置太远 ——
+            const moveRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.moveProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const mv = JSON.parse(moveRaw) as {
+              from: number[]
+              to: number[]
+              expected: number[]
+              drift: number
+            }
+            console.log(
+              `[e2e] 移动探针：从 ${JSON.stringify(mv.from)} 拖到 ${JSON.stringify(mv.to)}，期望 ${JSON.stringify(mv.expected)}（偏差 ${mv.drift.toFixed(2)}）`,
+            )
+            if (mv.drift > 20) {
+              problems.push(`拖动图层时位置偏移过大（${mv.drift.toFixed(1)}），吸附可能过强`)
+            }
+
+            // —— 文字包围盒探针：文字不能被画布裁掉 ——
+            const tbRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.textBoundsProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const tb = JSON.parse(tbRaw) as {
+              size: number[]
+              canvas: number[]
+              bbox: number[]
+              clipped: boolean
+            }
+            console.log(
+              `[e2e] 文字包围盒：transform.size=${JSON.stringify(tb.size)} 画布=${JSON.stringify(tb.canvas)} 文字实际范围=${JSON.stringify(tb.bbox)} 被裁=${tb.clipped}`,
+            )
+            if (tb.clipped) problems.push('文字被画布裁切了（显示会不完整）')
+            if (JSON.stringify(tb.size) !== JSON.stringify(tb.canvas)) {
+              problems.push('文字图层的 transform.size 与画布尺寸不一致，变换框会对不上')
+            }
+
+            // —— 新建文字探针：点空白新建时不能显示任何字 ——
+            const tnRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.textNewProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const tn = JSON.parse(tnRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 新建文字：建层后画布=${String(tn['emptyCanvas'])} 不透明像素=${String(tn['emptyOpaque'])}；输入后内容=「${String(tn['typedContent'])}」画布=${String(tn['typedCanvas'])} 不透明像素=${String(tn['typedOpaque'])}`,
+            )
+            if (Number(tn['emptyOpaque']) !== 0) {
+              problems.push('新建文字图层时不该显示任何文字（应当为空）')
+            }
+            if (Number(tn['typedOpaque']) === 0) {
+              problems.push('输入文字后没有渲染出内容')
+            }
+
+            // —— 文字编辑器探针：编辑框必须真的可用（够宽、文字透明）——
+            const teRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.textEditorProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const te = JSON.parse(teRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 文字编辑器：存在=${String(te['exists'])} 尺寸=${String(te['width'])}×${String(te['height'])} 文字色=${String(te['textColor'])} 光标色=${String(te['caretColor'])} 已聚焦=${String(te['focused'])}`,
+            )
+            if (!te['exists']) {
+              problems.push('用文字工具点击画布后没有出现编辑框（文字工具无反应）')
+            } else {
+              const rawColor = String(te['textColor']).replace(/\s+/g, '')
+              const isTransparent =
+                rawColor === 'rgba(0,0,0,0)' || rawColor === 'transparent' || /,0\)$/.test(rawColor)
+              if (!isTransparent) {
+                problems.push(`编辑框里的文字不是透明的（实际 ${rawColor}），会与画布文字重影`)
+              }
+              if (Number(te['width']) < 100) {
+                problems.push(`编辑框宽度只有 ${String(te['width'])}px，窄到看不见`)
+              }
+              if (!te['focused']) {
+                problems.push('编辑框没有获得焦点，无法直接输入')
+              }
+              if (!te['prevented']) {
+                problems.push(
+                  '文字工具没有阻止 pointerdown 的默认行为——真实鼠标点击会把焦点抢走，编辑框立刻失焦并删掉空图层（点下去像没反应）',
+                )
+              }
+            }
+
+            // —— 真实鼠标事件下的文字工具 ——
+            // 前面的探针都是直接调事件处理函数，绕过了浏览器的默认行为（焦点转移）。
+            // 这里用 sendInputEvent 发真实鼠标事件，才能覆盖「点下去没反应」这一类问题。
+            const ptRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.prepareTextTool().then(r => JSON.stringify(r))',
+            )) as string
+            const pt = JSON.parse(ptRaw) as { x: number; y: number }
+            win.webContents.sendInputEvent({
+              type: 'mouseDown',
+              x: pt.x,
+              y: pt.y,
+              button: 'left',
+              clickCount: 1,
+            })
+            win.webContents.sendInputEvent({
+              type: 'mouseUp',
+              x: pt.x,
+              y: pt.y,
+              button: 'left',
+              clickCount: 1,
+            })
+            await new Promise((resolve) => setTimeout(resolve, 180))
+            const rsRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.textEditorState().then(r => JSON.stringify(r))',
+            )) as string
+            const rs = JSON.parse(rsRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 真实点击文字工具：编辑框=${String(rs['exists'])} 宽=${String(rs['width'])} 焦点=${String(rs['focused'])} 图层数=${String(rs['layers'])}`,
+            )
+            if (!rs['exists'] || Number(rs['layers']) === 0) {
+              problems.push('真实鼠标点击下文字工具没有留下编辑框或图层（点下去没反应）')
+            }
+            if (rs['exists'] && !rs['focused']) {
+              problems.push('真实鼠标点击后编辑框没有保持焦点，用户无法直接输入')
+            }
+
+            // —— 文字显示探针：屏幕上必须真的出现文字，且第二次修改也要生效 ——
+            const trRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.textRenderProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const tr = JSON.parse(trRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 文字显示：空图层白色像素=${String(tr['empty'])}；输入一次=${String(tr['once'])}；再改一次=${String(tr['twice'])}`,
+            )
+            if (Number(tr['empty']) !== 0) {
+              problems.push('空文字图层在屏幕上不该出现白色像素')
+            }
+            if (Number(tr['once']) === 0) {
+              problems.push('输入文字后屏幕上没有显示任何文字（打上字没有显示）')
+            }
+            if (Number(tr['twice']) <= Number(tr['once'])) {
+              problems.push('第二次修改文字后屏幕没有更新（改了没反应）')
+            }
+
+            // —— 光标定位探针：在编辑框内点一下，光标必须能移到点到的位置 ——
+            const cpRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.textCaretProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const cp = JSON.parse(cpRaw) as Record<string, unknown>
+            if (cp['ok']) {
+              const cx = Number(cp['x'])
+              const cy = Number(cp['y'])
+              win.webContents.sendInputEvent({ type: 'mouseDown', x: cx, y: cy, button: 'left', clickCount: 1 })
+              win.webContents.sendInputEvent({ type: 'mouseUp', x: cx, y: cy, button: 'left', clickCount: 1 })
+              await new Promise((resolve) => setTimeout(resolve, 140))
+              const csRaw = (await win.webContents.executeJavaScript(
+                'window.__e2e.textCaretState().then(r => JSON.stringify(r))',
+              )) as string
+              const cs = JSON.parse(csRaw) as Record<string, unknown>
+              console.log(
+                `[e2e] 文字光标：点击前=${String(cp['before'])} 点击后=${String(cs['selectionStart'])} 长度=${String(cp['length'])} 聚焦=${String(cs['focused'])}`,
+              )
+              if (Number(cs['selectionStart']) === Number(cp['length'])) {
+                problems.push('在编辑框内点击后光标仍停在末尾，无法定位到文字中间')
+              }
+              if (!cs['focused']) {
+                problems.push('在编辑框内点击后编辑框失去了焦点')
+              }
+            }
+
+            // —— 富文本探针：局部换字体 / 换字号 / 换颜色 ——
+            const richRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.richTextProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const rich = JSON.parse(richRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 富文本：原尺寸=${JSON.stringify(rich['plain'])} 换字体=${JSON.stringify(rich['mixedFont'])} 换字号=${JSON.stringify(rich['bigSize'])} 红色像素=${String(rich['redPixels'])} runs=${String(rich['fontRunCount'])}/${String(rich['colorRunCount'])}/${String(rich['sizeRunCount'])}`,
+            )
+            if (Number(rich['redPixels']) <= 0) {
+              problems.push('局部颜色 run 没有生效（画布上没有出现红色像素）')
+            }
+            const richBig = rich['bigSize'] as unknown as number[]
+            const richPlain = rich['plain'] as unknown as number[]
+            if (richBig[1]! <= richPlain[1]!) {
+              problems.push('局部字号 run 没有生效（图层高度没有变大）')
+            }
+            if (Number(rich['fontRunCount']) !== 1) {
+              problems.push('局部字体 run 没有被记录')
+            }
+
+            // —— PSD 往返探针：导出再读回必须一致 ——
+            const psRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.psdRoundTripProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const psv = JSON.parse(psRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] PSD 往返：导出 ${String(psv['exportedBytes'])} 字节；读回 文档=${String(psv['docWidth'])}×${String(psv['docHeight'])} 图层数=${String(psv['layerCount'])} 名=${String(psv['firstName'])} 尺寸=${String(psv['firstWidth'])}×${String(psv['firstHeight'])} 位置=${String(psv['firstX'])},${String(psv['firstY'])} 中心像素=${String(psv['centerPixel'])}`,
+            )
+            if (Number(psv['exportedBytes']) <= 0) {
+              problems.push('导出 PSD 得到的字节为空')
+            }
+            if (Number(psv['docWidth']) !== 120 || Number(psv['docHeight']) !== 90) {
+              problems.push('PSD 读回的文档尺寸与原文档不一致')
+            }
+            if (Number(psv['layerCount']) !== 1) {
+              problems.push(`PSD 读回的图层数不是 1（实际 ${String(psv['layerCount'])}）`)
+            }
+            if (Number(psv['firstWidth']) !== 40 || Number(psv['firstHeight']) !== 40) {
+              problems.push('PSD 读回的图层尺寸与原来不一致')
+            }
+            if (Number(psv['firstX']) !== 17 || Number(psv['firstY']) !== 23) {
+              problems.push('PSD 读回的图层位置与原来不一致')
+            }
+            if (String(psv['centerPixel']) !== '0,200,80,255') {
+              problems.push(`PSD 读回的像素与原来不一致（${String(psv['centerPixel'])}）`)
+            }
+
+            // —— 面板定位探针：展开后必须完全落在窗口内 ——
+            const pbRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.panelBoundsProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const pb = JSON.parse(pbRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 面板定位：字体面板 右缘=${String(pb['fontRight'])}/窗口${String(pb['fontViewport'])} 超出=${String(pb['fontRightOverflow'])}；颜色面板 右缘=${String(pb['colorRight'])} 超出=${String(pb['colorRightOverflow'])}`,
+            )
+            for (const key of ['font', 'color']) {
+              if (pb[`${key}Ok`] === false) {
+                problems.push(`${key} 选择器面板没有找到或没有展开`)
+                continue
+              }
+              if (pb[`${key}RightOverflow`] === true || pb[`${key}LeftOverflow`] === true) {
+                problems.push(`${key} 选择器面板超出了窗口边界，会被裁掉`)
+              }
+            }
+
+            // —— 颜色选择器探针：必须是自绘的 ——
+            const cpkRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.colorPickerProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const cpk = JSON.parse(cpkRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 颜色选择器：选项栏里原生颜色控件=${String(cpk['legacyCount'])} 个；自绘 展开=${String(cpk['open'])} 色相条=${String(cpk['hasHue'])} 明度区=${String(cpk['hasSv'])} hex=${String(cpk['hexValue'])}`,
+            )
+            if (!cpk['ok']) {
+              problems.push('没有找到自绘颜色选择器')
+            } else {
+              if (Number(cpk['legacyCount']) > 0) {
+                problems.push('选项栏里仍有原生颜色控件，风格无法统一')
+              }
+              if (!cpk['open']) problems.push('颜色选择器点击后没有展开')
+              if (!cpk['hasHue'] || !cpk['hasSv']) {
+                problems.push('颜色选择器缺少色相条或饱和度/明度区域')
+              }
+              if (!/^#[0-9a-f]{6}$/i.test(String(cpk['hexValue']))) {
+                problems.push(`颜色选择器的十六进制输入值不是 #rrggbb（${String(cpk['hexValue'])}）`)
+              }
+            }
+
+            // —— 选项栏稳定性探针：改样式不能重建选项栏 ——
+            const obRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.optionsBarStabilityProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const ob = JSON.parse(obRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 选项栏稳定性：改样式后颜色框还是同一个=${String(ob['colorSame'])}（仍挂在文档上=${String(ob['colorStillConnected'])}），字体按钮同一个=${String(ob['fontBtnSame'])}`,
+            )
+            if (!ob['colorSame']) {
+              problems.push('改样式会重建选项栏，正在拖动的控件被销毁（取色器会立刻关闭）')
+            }
+
+            // —— 控件外观探针：滑块与颜色框 ——
+            const wgRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.widgetStyleProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const wg = JSON.parse(wgRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 控件外观：滑块 appearance=${String(wg['rangeAppearance'])} 高=${String(wg['rangeHeight'])}；颜色框 padding=${String(wg['colorPadding'])} 边框=${String(wg['colorBorderWidth'])}/${String(wg['colorBorderColor'])}`,
+            )
+            if (wg['rangeOk'] && String(wg['rangeAppearance']) !== 'none') {
+              problems.push('滑块仍是系统默认外观（appearance 不是 none）')
+            }
+            if (wg['colorOk']) {
+              if (String(wg['colorPadding']) !== '0px') {
+                problems.push(`颜色框仍带原生内边距（${String(wg['colorPadding'])}），边框会显得很粗`)
+              }
+              if (String(wg['colorBorderWidth']) !== '1px') {
+                problems.push(`颜色框边框宽度是 ${String(wg['colorBorderWidth'])}，应为 1px`)
+              }
+            }
+
+            // —— 输入框样式探针：不能用浏览器默认外观 ——
+            const inpRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.inputStyleProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const inp = JSON.parse(inpRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 输入框样式：高=${String(inp['height'])} 背景=${String(inp['background'])} 边框=${String(inp['borderColor'])} appearance=${String(inp['appearance'])}`,
+            )
+            if (!inp['ok']) {
+              problems.push('选项栏里没有找到数字输入框')
+            } else {
+              if (String(inp['appearance']) !== 'textfield') {
+                problems.push('数字输入框仍带原生上下箭头（appearance 不是 textfield）')
+              }
+              const bg = String(inp['background']).replace(/\s+/g, '')
+              if (/(255,255,255)|(250,250,250)/.test(bg)) {
+                problems.push(`数字输入框背景仍是浏览器默认白色（${bg}）`)
+              }
+              if (String(inp['height']) === 'auto') {
+                problems.push('数字输入框没有设置高度，会随浏览器默认尺寸变化')
+              }
+            }
+
+            // —— 面板探针：文字栏去掉描边、图层面板底部有效果按钮 ——
+            const peRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.panelEffectsProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const pe = JSON.parse(peRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 面板布局：文字选项栏含描边=${String(pe['hasTextStroke'])}，图层面板底部有效果按钮=${String(pe['hasEffectsBtn'])}（共 ${String(pe['footCount'])} 个）`,
+            )
+            if (pe['hasTextStroke']) {
+              problems.push('文字工具选项栏里仍然有「描边」控件')
+            }
+            if (!pe['hasEffectsBtn']) {
+              problems.push('图层面板底部没有「图层效果」按钮')
+            }
+
+            // —— 图层描边探针：外侧描边必须是实色外扩 ——
+            const lsRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.layerStrokeProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const ls = JSON.parse(lsRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 图层描边：加描边前红色像素=${String(ls['beforeStroke'])}，加 6px 描边后=${String(ls['strokePixels'])}，实色占比=${String(ls['opaqueRatio'])}`,
+            )
+            if (Number(ls['strokePixels']) <= 0) {
+              problems.push('图层描边没有画出来')
+            }
+            if (Number(ls['opaqueRatio']) < 0.5) {
+              problems.push(
+                `图层描边不是实色外扩（完全不透明占比仅 ${String(ls['opaqueRatio'])}），仍然发散`,
+              )
+            }
+
+            // —— 选择同步探针：选一次就要立刻显示新字体 ——
+            const fsRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.fontPickSyncProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const fsp = JSON.parse(fsRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 字体选择同步：选前=${String(fsp['before'])} → 选中=${String(fsp['picked'])} → 选后显示=${String(fsp['after'])} 同步=${String(fsp['synced'])}`,
+            )
+            if (!fsp['ok']) {
+              problems.push(`字体选择同步探针未就绪：${String(fsp['reason'])}`)
+            } else if (!fsp['synced']) {
+              problems.push('选择字体后，选择器显示的仍是旧字体（要再选一次才更新）')
+            }
+
+            // —— 字体选择器探针：按钮与列表项各自用各自字体 ——
+            const ffRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.fontFieldProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const ff = JSON.parse(ffRaw) as Record<string, unknown>
+            const ffSample = (ff['sample'] as string[] | undefined) ?? []
+            console.log(
+              `[e2e] 字体选择器：展开=${String(ff['open'])} 列表项=${String(ff['rowCount'])} 不同字体数=${String(ff['distinct'])} 按钮=${String(ff['beforeText'])}`,
+            )
+            for (const line of ffSample) console.log(`[e2e]   行：${line}`)
+            if (!ff['ok']) {
+              problems.push('没有找到自绘字体选择器')
+            } else {
+              if (Number(ff['rowCount']) <= 0) problems.push('字体选择器展开后没有任何列表项')
+              if (!ff['open']) problems.push('字体选择器点击后没有展开')
+              if (Number(ff['distinct']) <= 1) {
+                problems.push('字体列表各项没有用各自的字体渲染（全都是同一字体）')
+              }
+              if (!String(ff['beforeFamily']).includes('"')) {
+                problems.push('字体选择器按钮没有设置字体')
+              }
+            }
+
+            // —— 字体可用性探针：列出「能被选中、但选了其实不生效」的字体 ——
+            const fuRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.fontUsabilityProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const fu = JSON.parse(fuRaw) as Record<string, unknown>
+            const fuRows = fu['rows'] as { font: string; width: number; ineffective: boolean }[]
+            console.log(
+              `[e2e] 字体可用性：下拉框共 ${String(fu['total'])} 项，选了不生效的 ${String(fu['ineffectiveCount'])} 项`,
+            )
+            for (const row of fuRows.filter((r) => r.ineffective).slice(0, 8)) {
+              console.log(`[e2e]   ✗ 无效字体名：${row.font}`)
+            }
+            if (Number(fu['total']) < 20) {
+              problems.push('过滤后字体列表太少（可能把可用字体也滤掉了）')
+            }
+            if (Number(fu['ineffectiveCount']) > 0) {
+              problems.push(
+                `字体下拉框里有 ${String(fu['ineffectiveCount'])} 项选了不生效（字体名无法被解析）`,
+              )
+            }
+
+            // —— 字体替换探针：局部 run 不能挡住整层换字体 ——
+            const frRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.fontReplaceProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const fr = JSON.parse(frRaw) as Record<string, unknown>
+            const frBefore = fr['before'] as { fontName?: string; runs?: number }
+            const frAfter = fr['after'] as { fontName?: string; runs?: number }
+            console.log(
+              `[e2e] 字体替换：换前 字体=${String(frBefore?.['fontName'])} 局部run=${String(frBefore?.['runs'])}；换后 字体=${String(frAfter?.['fontName'])} 局部run=${String(frAfter?.['runs'])}`,
+            )
+            if (frAfter?.['fontName'] !== 'KaiTi') {
+              problems.push('改整层字体没有生效')
+            }
+            if (Number(frAfter?.['runs']) !== 0) {
+              problems.push(
+                `改整层字体后仍残留 ${String(frAfter?.['runs'])} 个局部字体 run（部分字替换不成功）`,
+              )
+            }
+
+            // —— 版本号压力探针：连续 20 次改动都必须反映到屏幕 ——
+            const vsRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.versionStressProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const vs = JSON.parse(vsRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 版本压力：${String(vs['rounds'])} 轮交替字号，不同结果数=${String(vs['distinct'])}，相邻重复（屏幕未更新）=${String(vs['stuck'])}`,
+            )
+            if (Number(vs['stuck']) > 0) {
+              problems.push(`连续改动中有 ${String(vs['stuck'])} 次屏幕没有更新（渲染没跟上）`)
+            }
+            if (Number(vs['distinct']) < 2) {
+              problems.push('连续改动后屏幕内容没有变化，渲染管线可能卡在旧数据')
+            }
+
+            // —— 描边探针：实色外扩，不是发散模糊 ——
+            const stRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.textStrokeProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const st = JSON.parse(stRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 文字描边：无描边尺寸=${JSON.stringify(st['plain'])} 加 4px 描边=${JSON.stringify(st['stroked'])} 描边像素=${String(st['redPixels'])} 实色占比=${String(st['opaqueRatio'])} 平均不透明度=${String(st['redAvgAlpha'])}`,
+            )
+            const stPlain = st['plain'] as unknown as number[]
+            const stStroked = st['stroked'] as unknown as number[]
+            if (Number(st['redPixels']) <= 0) {
+              problems.push('文字描边没有画出来')
+            }
+            if (stStroked[0]! <= stPlain[0]!) {
+              problems.push('加了描边后画布没有变大，描边会被切掉')
+            }
+            if (Number(st['opaqueRatio']) < 0.5) {
+              problems.push(
+                `描边不是实色外扩（完全不透明像素占比仅 ${String(st['opaqueRatio'])}），仍然发散`,
+              )
+            }
+
+            // —— 字体列表探针：不能为空、不能有乱码 ——
+            const fontListRaw = (await win.webContents.executeJavaScript(
+              'window.compositor.listFonts().then(r => JSON.stringify(r))',
+            )) as string
+            const fonts = JSON.parse(fontListRaw) as string[]
+            const mojibake = fonts.filter((f) => f.includes('\uFFFD')).length
+            console.log(
+              `[e2e] 字体列表：共 ${fonts.length} 个，乱码 ${mojibake} 个，样例=${fonts.slice(0, 5).join(' / ')}`,
+            )
+            if (fonts.length < 20) problems.push('系统字体列表太少或为空（读取失败）')
+            if (mojibake > 0) problems.push(`字体列表里有 ${mojibake} 项是乱码`)
+
+            // —— 选区样式探针：选中两个字改字体，整层字体不该变、只该多出一个 run ——
+            const rs2Raw = (await win.webContents.executeJavaScript(
+              'window.__e2e.rangeStyleProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const rs2 = JSON.parse(rs2Raw) as Record<string, unknown>
+            const before = rs2['before'] as { fontName?: string; runs?: number }
+            const after = rs2['after'] as { fontName?: string; runs?: number; run?: unknown }
+            console.log(
+              `[e2e] 选区样式：整层字体 ${String(before?.['fontName'])}→${String(after?.['fontName'])}，run 数 ${String(before?.['runs'])}→${String(after?.['runs'])}，run=${JSON.stringify(after?.['run'])}`,
+            )
+            if (after?.['fontName'] !== before?.['fontName']) {
+              problems.push('选中部分改字体时整层字体也被改了（应当只影响选区）')
+            }
+            if (Number(after?.['runs']) !== 1) {
+              problems.push('选中部分改字体没有写出 fontRuns（只改选区不生效）')
+            }
+
+            // —— 框与图片对位探针：变换框必须正好框住图片 ——
+            const fvRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.frameVsImageProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const fv = JSON.parse(fvRaw) as {
+              imageBBox: number[]
+              frameRect: number[]
+              dx: number
+              dy: number
+              matches: boolean
+            }
+            console.log(
+              `[e2e] 框与图片对位：图片实际=${JSON.stringify(fv.imageBBox.map((v) => Math.round(v)))} 框应为=${JSON.stringify(fv.frameRect.map((v) => Math.round(v)))}（偏差 ${fv.dx.toFixed(1)}, ${fv.dy.toFixed(1)}）`,
+            )
+            if (!fv.matches) problems.push('变换框与图片的实际渲染位置不重合')
+
+            // —— 自动选择探针：点图片要选中图片图层，而不是压在它上面的空白层 ——
+            const asRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.autoSelectProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const as = JSON.parse(asRaw) as {
+              picked: string | null
+              blankOnTop: boolean
+              missIsNull: boolean
+              ok: boolean
+            }
+            console.log(
+              `[e2e] 自动选择：上层空白层=${as.blankOnTop}，点图片选中「${as.picked}」，点空白未选中=${as.missIsNull}`,
+            )
+            if (!as.ok) problems.push('移动工具的自动选择没有选中图片所在的图层')
+
+            // —— 用户流程探针：拖入 → 选区 → Ctrl+J 后副本不能颠倒 ——
+            const ufRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.userFlowProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const uf = JSON.parse(ufRaw) as Record<string, unknown>
+            console.log(`[e2e] 用户流程：原件=${String(uf['srcTransform'])} 画布=${String(uf['srcCanvas'])}`)
+            console.log(`[e2e] 用户流程：副本=${String(uf['copyTransform'])} 画布=${String(uf['copyCanvas'])}`)
+            console.log(`[e2e] 用户流程：原件颜色序列=${JSON.stringify(uf['srcColumn'])}`)
+            console.log(`[e2e] 用户流程：副本颜色序列=${JSON.stringify(uf['copyColumn'])}`)
+            {
+              const srcCol = uf['srcColumn'] as string[]
+              const copyCol = uf['copyColumn'] as string[]
+              if (srcCol && copyCol && copyCol.join(',') !== srcCol.join(',')) {
+                problems.push(`复制后颜色顺序变了：原件 ${srcCol.join('→')}，副本 ${copyCol.join('→')}`)
+              }
+            }
+
+            // —— 无选区 JPEG 复制探针：对应「拖入 jpg → 直接 Ctrl+J」——
+            const jpgRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.jpegCopyProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const jp = JSON.parse(jpgRaw) as Record<string, unknown>
+            console.log(`[e2e] JPEG复制：原件=${String(jp['srcTransform'])}`)
+            console.log(`[e2e] JPEG复制：副本=${String(jp['copyTransform'])} 位置相同=${String(jp['samePosition'])}`)
+            console.log(`[e2e] JPEG复制：原件画布列=${JSON.stringify(jp['srcCanvasCol'])}`)
+            console.log(`[e2e] JPEG复制：副本画布列=${JSON.stringify(jp['copyCanvasCol'])}`)
+            console.log(`[e2e] JPEG复制：屏幕列（上/中/下）=${JSON.stringify(jp['screenCol'])}`)
+            {
+              const a = jp['srcCanvasCol'] as string[]
+              const b = jp['copyCanvasCol'] as string[]
+              if (a && b && a.join(',') !== b.join(',')) {
+                problems.push(`无选区复制后副本画布方向变了：原件 ${a.join('→')}，副本 ${b.join('→')}`)
+              }
+              const sc = jp['screenCol'] as string[]
+              if (sc) {
+                const firstRed = sc.indexOf('红')
+                const firstBlue = sc.indexOf('蓝')
+                if (firstRed < 0 || firstBlue < 0) {
+                  problems.push(`屏幕列里没有同时找到红色与蓝色：${sc.join(',')}`)
+                } else if (firstRed > firstBlue) {
+                  problems.push(`屏幕上下颠倒：蓝色出现在红色上方（${sc.join(',')}）`)
+                }
+              }
+            }
+            console.log(
+              `[e2e] JPEG复制：视图 zoom=${await win.webContents.executeJavaScript('window.__app.view.zoom')} panY=${await win.webContents.executeJavaScript('window.__app.view.panY')}`,
+            )
           } catch (err) {
             problems.push(`端到端流程抛错：${String(err)}`)
           } finally {

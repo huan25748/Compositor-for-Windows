@@ -23,10 +23,12 @@ const api = {
   /** 选择图片文件并返回原始字节。 */
   pickImages: (): Promise<{ name: string; bytes: Uint8Array }[]> => ipcRenderer.invoke('images:pick'),
   /** 保存导出的位图。 */
-  saveImage: (opts: { suggested: string; format: 'png' | 'jpeg'; bytes: Uint8Array }): Promise<string | null> =>
+  saveImage: (opts: { suggested: string; format: 'png' | 'jpeg' | 'psd'; bytes: Uint8Array }): Promise<string | null> =>
     ipcRenderer.invoke('image:save', opts),
   /** 在资源管理器中定位文件。 */
   reveal: (path: string): Promise<void> => ipcRenderer.invoke('shell:reveal', path),
+  /** 系统已安装的字体名列表。 */
+  listFonts: (): Promise<string[]> => ipcRenderer.invoke('fonts:list'),
   /** 版本信息。 */
   info: (): Promise<{ version: string; electron: string; chrome: string }> => ipcRenderer.invoke('app:info'),
   /** 订阅菜单命令。 */

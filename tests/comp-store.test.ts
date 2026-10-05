@@ -64,7 +64,7 @@ test('写盘后读回：manifest 与资源完全一致', async () => {
     // 不应残留临时文件
     assert.equal(existsSync(join(target, '.manifest.json.tmp')), false)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(() => undefined)
   }
 })
 
@@ -91,7 +91,7 @@ test('另存后未引用的旧图片被清理', async () => {
     const loaded = await readComp(target)
     assert.equal(loaded.manifest.layers.length, 2)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(() => undefined)
   }
 })
 
@@ -107,7 +107,7 @@ test('资源缺失时整份拒绝（官方行为）', async () => {
 
     await assert.rejects(() => readComp(target), /缺少图片资源/)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(() => undefined)
   }
 })
 
@@ -117,7 +117,7 @@ test('缺少 manifest.json 报中文错误', async () => {
     await mkdir(join(dir, 'empty.comp'), { recursive: true })
     await assert.rejects(() => readComp(join(dir, 'empty.comp')), /缺少 manifest\.json/)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(() => undefined)
   }
 })
 
@@ -129,7 +129,7 @@ test('manifest 是数组时被拒绝（不是对象）', async () => {
     await writeFile(join(target, 'manifest.json'), '[1,2,3]', 'utf8')
     await assert.rejects(() => readComp(target), /根节点必须是对象/)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(() => undefined)
   }
 })
 
@@ -145,6 +145,6 @@ test('写出的 manifest 能被本程序的解析器重新读入（互操作闭�
     assert.equal(reread.version, 11)
     assert.equal(reread.layers.length, 3)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(() => undefined)
   }
 })

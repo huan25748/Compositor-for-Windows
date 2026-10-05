@@ -8,7 +8,6 @@ export type ToolID =
   | 'wand'
   | 'brush'
   | 'eraser'
-  | 'gradient'
   | 'eyedropper'
   | 'crop'
   | 'hand'
@@ -36,7 +35,6 @@ export const TOOLS: ToolDef[] = [
   { id: 'wand', name: '魔棒', icon: 'wand', shortcut: 'W', hint: '点击以选择相近颜色区域' },
   { id: 'brush', name: '画笔', icon: 'brush', shortcut: 'B', hint: '拖动以绘制' },
   { id: 'eraser', name: '橡皮擦', icon: 'eraser', shortcut: 'E', hint: '拖动以擦除' },
-  { id: 'gradient', name: '渐变', icon: 'gradient', shortcut: 'G', hint: '拖动以填充渐变' },
   { id: 'text', name: '文字', icon: 'text', shortcut: 'T', hint: '点击画布添加文字；双击已有文字图层可再次编辑' },
   { id: 'shape', name: '形状', icon: 'shape', shortcut: 'U', hint: '拖动以绘制形状（保持可再编辑）' },
   { id: 'clone', name: '仿制图章', icon: 'clone', shortcut: 'S', hint: '按住 Alt 点击设置仿制源点，然后拖动复制' },
