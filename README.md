@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Compositor for Windows
 
 Mac 版 [Compositor](https://github.com/robbietilton/Compositor)（"The Photoshop alternative for Mac"，MIT 许可）的
@@ -259,3 +260,7 @@ W3C alpha 公式合并到另一个帧缓冲（乒乓双缓冲），因此任意�
 
 MIT。上游 Compositor 由 Robbie Tilton 创作（<https://github.com/robbietilton/Compositor>）。
 本复刻不包含任何上游二进制或资源。
+=======
+# Compositor-for-Windows
+Compositor的windows复刻版
+>>>>>>> 8402f293309b2714c71dfbd62d40f0ed6bbcb4d0
