@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Compositor for Windows
 
 Mac 版 [Compositor](https://github.com/robbietilton/Compositor)（"The Photoshop alternative for Mac"，MIT 许可）的
