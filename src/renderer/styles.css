@@ -1119,3 +1119,198 @@ input[type='color']::-webkit-color-swatch {
   outline: none;
   border-color: var(--accent);
 }
+
+/* —— 描边列表 ——
+ * 每个描边一个独立小块：标题行（编号 + 删除）、位置（外侧/内侧分段）、大小与颜色。
+ * 原先把 5 个控件塞在一行里，既挤又看不出「内侧」这个复选框在管什么。 */
+.stroke-list {
+  display: grid;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0;
+}
+
+.stroke-item {
+  padding: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+}
+
+.stroke-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--sp-2);
+}
+
+.stroke-title {
+  color: var(--text-dim);
+  font-size: var(--fs-body);
+}
+
+.segment {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+}
+
+.segment-btn {
+  min-width: 54px;
+  height: 22px;
+  padding: 0 var(--sp-2);
+  border: none;
+  border-radius: var(--r-chip);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: var(--fs-caption);
+  cursor: pointer;
+}
+
+.segment-btn:hover {
+  color: var(--text);
+}
+
+.segment-btn.on {
+  background: var(--selected);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* —— 起始页 ——
+ * 启动后先看到它；新建 / 打开 / 导入之后才进入工作区。 */
+.welcome {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+}
+
+.welcome-inner {
+  display: grid;
+  gap: 32px;
+  justify-items: center;
+  width: min(780px, calc(100% - 64px));
+}
+
+.welcome-brand {
+  text-align: center;
+}
+
+.welcome-title {
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--text);
+}
+
+.welcome-sub {
+  margin-top: 6px;
+  font-size: var(--fs-heading);
+  color: var(--text-dim);
+}
+
+.welcome-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-3);
+  width: 100%;
+}
+
+.welcome-card {
+  display: grid;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--bg-panel);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.welcome-card:hover {
+  border-color: var(--accent);
+  background: var(--bg-panel-2);
+}
+
+.welcome-card-icon svg {
+  width: 28px;
+  height: 28px;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.welcome-card-title {
+  display: block;
+  font-size: var(--fs-heading);
+}
+
+.welcome-card-desc {
+  display: block;
+  margin-top: 4px;
+  font-size: var(--fs-caption);
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.welcome-foot {
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+}
+
+.welcome-keys,
+.welcome-version {
+  font-size: var(--fs-caption);
+  color: var(--text-mute);
+  text-align: center;
+}
+
+/* —— 新建项目的比例预设 ——
+ * 图标是相同高度、不同宽高比的框：形状本身就提示比例，配文字标签更明确。 */
+.preset-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+
+.preset-btn {
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+  padding: var(--sp-2) 4px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text-dim);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.preset-btn:hover {
+  border-color: var(--accent);
+  background: var(--bg-panel-2);
+  color: var(--text);
+}
+
+.preset-icon svg {
+  width: 26px;
+  height: 26px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+}
+
+.preset-label {
+  font-size: var(--fs-caption);
+}

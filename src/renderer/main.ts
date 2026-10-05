@@ -4,9 +4,10 @@
  */
 import { Compositor, type ViewTransform } from './gl/renderer.ts'
 import { Editor, bumpPixels, type TextStyle } from './state/editor.ts'
-import { FONT_CHOICES, fontLabel, sortFonts } from './text.ts'
+import { FONT_CHOICES, charStyles, fontLabel, sortFonts } from './text.ts'
 import { fontPicker, type FontPickerHandle } from './ui/fontpicker.ts'
 import { colorPicker } from './ui/colorpicker.ts'
+import { createWelcome } from './ui/welcome.ts'
 import { exportPsd, importPsd } from './psd.ts'
 import { SHAPE_KINDS, type ShapeKind } from './shape.ts'
 import { cloneAt, healAt, liquifyAt, smudgeAt } from './retouch.ts'
@@ -89,6 +90,8 @@ class App {
     alignment: 'left' as 'left' | 'center' | 'right',
     tracking: 0,
     lineSpacing: 8,
+    /** 字重（CSS font-weight）。同一字体族常常打包多种字重，用它来挑。 */
+    fontWeight: 400,
     /** 描边：沿字形外缘向外扩一层实色。0 表示不描边。 */
     strokeWidth: 0,
     strokeColor: '#000000',
@@ -473,6 +476,28 @@ class App {
         this.updateTextStyle({ fontSize: Math.max(4, Number(size.value)) }),
       )
       bar.append(el('span', { class: 'opt-label', text: '字号' }), size)
+
+      // 字重：同一字体族常打包多种字重（Thin/Regular/Medium/Bold…），
+      // CSS 只能按「族名 + font-weight」去选，所以这里单独给一个选择器。
+      const weight = el('select', { class: 'select' })
+      for (const [value, label] of [
+        [100, '极细'],
+        [200, '特细'],
+        [300, '细'],
+        [400, '常规'],
+        [500, '中等'],
+        [600, '半粗'],
+        [700, '粗'],
+        [800, '特粗'],
+        [900, '极粗'],
+      ] as [number, string][]) {
+        weight.append(el('option', { value: String(value), text: `${label} ${value}` }))
+      }
+      weight.value = String(style.fontWeight ?? 400)
+      weight.addEventListener('change', () =>
+        this.updateTextStyle({ fontWeight: Number(weight.value) }),
+      )
+      bar.append(el('span', { class: 'opt-label', text: '字重' }), weight)
 
       const color = colorPicker({
         value: style.color,
@@ -1490,6 +1515,7 @@ class App {
     return {
       fontName: this.textStyle.fontName,
       fontSize: this.textStyle.fontSize,
+      fontWeight: this.textStyle.fontWeight,
       red: r,
       green: g,
       blue: b,
@@ -1628,8 +1654,16 @@ class App {
     ta.style.width = `${Math.max(240, t.size[0] * z)}px`
     ta.style.height = `${Math.max(t.size[1] * z, layer.text.fontSize * z * 1.4, 28)}px`
     ta.style.fontFamily = `"${layer.text.fontName}", "Microsoft YaHei UI", sans-serif`
-    ta.style.fontSize = `${layer.text.fontSize * z}px`
-    ta.style.lineHeight = `${(layer.text.fontSize + layer.text.lineSpacing) * z}px`
+    // 编辑框只能有一个字号，但富文本下每个字符的字号可能不同（sizeRuns）。
+    // 取「光标所在字符」的字号：这样至少在光标附近，编辑器与画布上的字是对齐的，
+    // 拖选时光标才不会按全程同一字号去算位置。整层字号相同时结果与原来一致。
+    const styles = charStyles(layer.text)
+    const caret = Math.min(Math.max(0, ta.selectionStart), Math.max(0, styles.length - 1))
+    const caretSize = styles[caret]?.fontSize ?? layer.text.fontSize
+    ta.style.fontSize = `${caretSize * z}px`
+    ta.style.lineHeight = `${(caretSize + layer.text.lineSpacing) * z}px`
+    // 字重也要带上，否则编辑框的字形宽度与画布不一致，光标同样会对不上
+    ta.style.fontWeight = String(styles[caret]?.fontWeight ?? layer.text.fontWeight ?? 400)
     ta.style.textAlign = layer.text.alignment
     ta.style.letterSpacing = `${layer.text.tracking * z}px`
     // 绝对不要在这里设置 color：编辑器里的字必须保持透明（见 styles.css），
@@ -1645,6 +1679,7 @@ class App {
       return {
         fontName: t.fontName,
         fontSize: t.fontSize,
+        fontWeight: t.fontWeight ?? 400,
         color: rgb01ToHex(t.red, t.green, t.blue),
         alignment: t.alignment,
         tracking: t.tracking,
@@ -1689,6 +1724,8 @@ class App {
           t.fontSize = patch.fontSize
           delete t.sizeRuns
         }
+        // 字重是整层的：不清 sizeRuns（那是字号），只改 weight
+        if (patch.fontWeight !== undefined) t.fontWeight = patch.fontWeight
         if (patch.alignment !== undefined) t.alignment = patch.alignment
         if (patch.tracking !== undefined) t.tracking = patch.tracking
         if (patch.lineSpacing !== undefined) t.lineSpacing = patch.lineSpacing
@@ -2418,16 +2455,58 @@ class App {
 
   // —— 文件 ——
 
+  /**
+   * 新建项目的常用比例预设。
+   * 图标是「相同高度、不同宽高比」的框，形状本身就提示了比例，再配文字标签。
+   */
+  private sizePresets(): { label: string; w: number; h: number; icon: string }[] {
+    const box = (x: number, y: number, w: number, h: number, rx = 1.5): string =>
+      `<svg viewBox="0 0 24 24"><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${rx}"/></svg>`
+    return [
+      { label: '1:1', w: 1080, h: 1080, icon: box(5, 5, 14, 14) },
+      { label: '4:3', w: 1600, h: 1200, icon: box(4, 6, 16, 12) },
+      { label: '3:2', w: 1800, h: 1200, icon: box(3, 6.5, 18, 11) },
+      { label: '16:9', w: 1920, h: 1080, icon: box(2.5, 7, 19, 10) },
+      { label: '9:16', w: 1080, h: 1920, icon: box(8, 2.5, 8, 19) },
+    ]
+  }
+
   private askNewDocument(): void {
     const w = numberInput(1280, { min: 1, max: LIMITS.maxPixelsPerSide })
     const h = numberInput(800, { min: 1, max: LIMITS.maxPixelsPerSide })
+
+    // 预设按钮排：点一下把尺寸填进上面的输入框，用户仍可继续手改
+    const presetRow = el('div', { class: 'preset-row' })
+    for (const preset of this.sizePresets()) {
+      const btn = el('button', {
+        class: 'preset-btn',
+        title: `${preset.w} × ${preset.h}`,
+        onClick: () => {
+          w.value = String(preset.w)
+          h.value = String(preset.h)
+        },
+      })
+      btn.append(
+        el('span', { class: 'preset-icon', html: preset.icon }),
+        el('span', { class: 'preset-label', text: preset.label }),
+      )
+      presetRow.append(btn)
+    }
+
     const fill = el('select')
     fill.append(el('option', { value: 'transparent', text: '透明' }))
     fill.append(el('option', { value: 'white', text: '白色' }))
     fill.append(el('option', { value: 'black', text: '黑色' }))
     modal({
       title: '新建项目',
-      body: [field('宽度（像素）', w), field('高度（像素）', h), field('背景', fill)],
+      body: [
+        el('div', { class: 'prop-hint', text: '常用比例' }),
+        presetRow,
+        el('div', { class: 'prop-hint', text: '或手动输入尺寸' }),
+        field('宽度（像素）', w),
+        field('高度（像素）', h),
+        field('背景', fill),
+      ],
       confirmLabel: '创建',
       onConfirm: () => {
         const width = Math.max(1, Math.min(LIMITS.maxPixelsPerSide, Math.round(Number(w.value))))
@@ -2443,7 +2522,12 @@ class App {
           doc.layers.push(layer)
           doc.activeLayerID = layer.id
           this.editor.loadDocument(doc, null)
-          this.editor.pixelStore.create(layer.id, width, height, fill.value === 'white' ? '#ffffff' : '#000000')
+          this.editor.pixelStore.create(
+            layer.id,
+            width,
+            height,
+            fill.value === 'white' ? '#ffffff' : '#000000',
+          )
         } else {
           this.editor.loadDocument(doc, null)
         }
@@ -2641,30 +2725,43 @@ class App {
 
   // —— 提示类对话 ——
 
+  /**
+   * 启动时显示整屏起始页：新建 / 打开 / 导入之后才进入工作区。
+   * （原先只是一个版本信息对话框，关掉就直接掉进空工作区。）
+   */
+  /** 起始页的根元素（存在时说明还没进入工作区）。 */
+  private welcomeEl: HTMLElement | null = null
+
+  /** 供自检使用：关掉起始页，直接进入工作区。 */
+  dismissWelcome(): void {
+    this.welcomeEl?.remove()
+    this.welcomeEl = null
+  }
+
   private showWelcome(): Promise<void> {
-    const info = window.compositor.info()
-    return info.then((v) => {
-      modal({
-        title: `Compositor for Windows v${v.version}`,
-        body: [
-          el('div', {
-            class: 'prop-hint',
-            text:
-              '这是 Mac 版 Compositor（github.com/robbietilton/Compositor，MIT）的 Windows 复刻版。\n' +
-              '项目格式 .comp 与 Mac 版完全互通：一个文件夹，含 manifest.json 与 images/ 里的 PNG 图层。',
-          }),
-          el('div', {
-            class: 'prop-hint',
-            text: `快捷键：V 移动 · M 矩形选框 · L 套索 · W 魔棒 · B 画笔 · E 橡皮 · I 吸管 · C 裁剪 · H 抓手 · Z 缩放\n空格拖动平移 · Ctrl+滚轮缩放 · Ctrl+S 保存 · Ctrl+Z 撤销`,
-          }),
-          el('div', {
-            class: 'prop-hint',
-            text: `运行环境：Electron ${v.electron} / Chromium ${v.chrome}`,
-          }),
-        ],
-        confirmLabel: '开始',
-        infoOnly: true,
-      })
+    return window.compositor.info().then((v) => {
+      const { root, hide } = createWelcome(
+        {
+          newDocument: () => {
+            hide()
+            this.welcomeEl = null
+            this.askNewDocument()
+          },
+          openProject: () => {
+            hide()
+            this.welcomeEl = null
+            void this.handleCommand('file.open')
+          },
+          importImage: () => {
+            hide()
+            this.welcomeEl = null
+            void this.handleCommand('file.import')
+          },
+        },
+        v,
+      )
+      this.welcomeEl = root
+      need('app').append(root)
     })
   }
 
@@ -3048,10 +3145,9 @@ try {
      * 此前 display:grid 盖掉了 hidden，模态遮罩一直挂在窗口上拦截所有鼠标操作。
      */
     async overlayProbe(): Promise<Record<string, string | boolean>> {
-      // 先走真实流程：点掉启动时的欢迎框。
-      // 修复前即使用户点了关闭（hidden=true），遮罩因 display:grid 仍在，
-      // 会持续拦掉全窗口的鼠标操作。
+      // 先走真实流程：关掉启动时的起始页（它是全屏遮罩，留着会拦掉后面所有真实点击）。
       await new Promise((resolve) => setTimeout(resolve, 250))
+      app.dismissWelcome()
       const dismiss = document.querySelector('#modalRoot .btn.primary')
       if (dismiss instanceof HTMLElement) dismiss.click()
       await new Promise((resolve) => requestAnimationFrame(() => resolve(null)))
@@ -3657,6 +3753,332 @@ try {
         to,
         expected: [target[0], target[1]],
         drift: Math.hypot(to[0]! - target[0], to[1]! - target[1]),
+      }
+    },
+
+    /** 渐变纹理探针：直接用 gradientTexture 的方式画一张，检查它是否真的是黑→白。 */
+    async gradientTextureProbe(): Promise<Record<string, unknown>> {
+      const canvas = document.createElement('canvas')
+      canvas.width = 256
+      canvas.height = 1
+      const ctx = canvas.getContext('2d')!
+      const grad = ctx.createLinearGradient(0, 0, 256, 0)
+      grad.addColorStop(0, 'rgb(0, 0, 0)')
+      grad.addColorStop(1, 'rgb(255, 255, 255)')
+      ctx.fillStyle = grad
+      ctx.fillRect(0, 0, 256, 1)
+      const px = ctx.getImageData(0, 0, 256, 1).data
+      const at = (x: number): string =>
+        `${px[x * 4]},${px[x * 4 + 1]},${px[x * 4 + 2]},${px[x * 4 + 3]}`
+      return { left: at(2), mid: at(128), right: at(253) }
+    },
+
+    /** 字重探针：顶栏要有字重选择器；改字重后画布上的字形宽度应当变化。 */
+    async fontWeightProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      app.tool = 'text'
+      const internals = app as unknown as {
+        currentTextMeta(): TextStyle
+        updateTextStyle(patch: Record<string, unknown>): void
+        buildOptionsBar(): void
+      }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [20, 20])
+      app.editor.previewText(layer.id, (t) => {
+        t.content = 'ABCD'
+      })
+      const normal = [...layer.transform.size].join('x')
+
+      internals.buildOptionsBar()
+      const hasWeightLabel = (document.getElementById('optionsBar')?.textContent ?? '').includes(
+        '字重',
+      )
+      const weightSelect = [...document.querySelectorAll('.options-bar select')].find((s) =>
+        [...(s as HTMLSelectElement).options].some((o) => o.value === '900'),
+      ) as HTMLSelectElement | undefined
+      const optionCount = weightSelect?.options.length ?? 0
+
+      internals.updateTextStyle({ fontWeight: 900 })
+      const bold = [...layer.transform.size].join('x')
+      return {
+        normal,
+        bold,
+        weight: layer.text?.fontWeight ?? 0,
+        hasWeightLabel,
+        optionCount,
+      }
+    },
+
+    /** 文字编辑器字号探针：改字号后编辑框的字号必须跟上，否则光标定位会按旧字号算。 */
+    async editorFontProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(400, 300))
+      app.tool = 'text'
+      const internals = app as unknown as {
+        currentTextMeta(): TextStyle
+        openTextEditor(id: string, all?: boolean): void
+        updateTextStyle(patch: Record<string, unknown>): void
+      }
+      const layer = app.editor.addTextLayer('', internals.currentTextMeta(), [20, 20])
+      internals.openTextEditor(layer.id, true)
+      const ta = document.querySelector('.text-editor') as HTMLTextAreaElement | null
+      // 必须先有内容，否则「选中一部分」无从谈起（空文本的 selectionStart/End 恒为 0）
+      app.editor.previewText(layer.id, (t) => {
+        t.content = 'ABCD'
+      })
+      if (ta) {
+        ta.value = 'ABCD'
+        ta.dispatchEvent(new Event('input'))
+      }
+      // 等两帧：syncTextEditor 是在 tick（rAF）里调用的，不等的话量到的是旧样式
+      const nextFrame = (): Promise<void> =>
+        new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        )
+      await nextFrame()
+      const before = ta ? getComputedStyle(ta).fontSize : '(无编辑框)'
+
+      // 情况一：无选区，改整层字号
+      ta?.setSelectionRange(0, 0)
+      internals.updateTextStyle({ fontSize: 96 })
+      await nextFrame()
+      const afterWhole = ta ? getComputedStyle(ta).fontSize : ''
+
+      // 情况二：有选区，只改选中部分的字号
+      ta?.setSelectionRange(0, 1)
+      internals.updateTextStyle({ fontSize: 24 })
+      await nextFrame()
+      const afterRange = ta ? getComputedStyle(ta).fontSize : ''
+
+      return {
+        before,
+        afterWhole,
+        afterRange,
+        layerFontSize: layer.text?.fontSize ?? 0,
+        sizeRuns: layer.text?.sizeRuns?.length ?? 0,
+        // 编辑框的实际盒子 vs 图层变换尺寸：两者不一致时光标就对不上文字
+        taRect: ta ? `${Math.round(ta.getBoundingClientRect().width)}x${Math.round(ta.getBoundingClientRect().height)}` : '',
+        layerSize: layer.transform.size.map((v) => Math.round(v)).join('x'),
+        taLineHeight: ta ? getComputedStyle(ta).lineHeight : '',
+        canvasLineHeight: `${Math.round((layer.text?.fontSize ?? 0) + (layer.text?.lineSpacing ?? 0))}px`,
+      }
+    },
+
+    /** 新建项目预设探针：应有 5 个比例预设（各带图标），点击能把尺寸填进输入框。 */
+    async newDocPresetProbe(): Promise<Record<string, unknown>> {
+      app.dismissWelcome()
+      ;(app as unknown as { askNewDocument(): void }).askNewDocument()
+
+      const btns = [...document.querySelectorAll('.preset-btn')] as HTMLElement[]
+      const labels = btns.map((b) => b.querySelector('.preset-label')?.textContent ?? '')
+      const icons = btns.filter((b) => b.querySelector('.preset-icon svg')).length
+
+      // 点 16:9，看尺寸输入框是否变成 1920 / 1080
+      const idx = labels.indexOf('16:9')
+      if (idx >= 0) btns[idx]!.click()
+      const inputs = [
+        ...document.querySelectorAll('#modalRoot input[type=number]'),
+      ] as HTMLInputElement[]
+      const values = inputs.map((i) => i.value)
+
+      // 关掉对话框，避免挡住后面的探针
+      const cancel = [...document.querySelectorAll('#modalRoot button')].find((b) =>
+        /取消|关闭/.test(b.textContent ?? ''),
+      )
+      ;(cancel as HTMLElement | undefined)?.click()
+      return {
+        count: btns.length,
+        labels: labels.join('|'),
+        icons,
+        values: values.join('|'),
+      }
+    },
+
+    /** 起始页探针：启动时应当有起始页，且三张卡片齐全；随后关掉它进入工作区。 */
+    async welcomeProbe(): Promise<Record<string, unknown>> {
+      const el2 = document.querySelector('.welcome')
+      const titles = [...document.querySelectorAll('.welcome-card-title')].map(
+        (t) => t.textContent ?? '',
+      )
+      const keys = document.querySelector('.welcome-keys')?.textContent ?? ''
+      const result = {
+        present: Boolean(el2),
+        cardCount: titles.length,
+        titles: titles.join('|'),
+        hasKeys: keys.length > 0,
+        hasTitle: (document.querySelector('.welcome-title')?.textContent ?? '') === 'Compositor',
+      }
+      // 关掉它，免得挡住后面的探针（真实点击会打在起始页上）
+      app.dismissWelcome()
+      return result
+    },
+
+    /** 描边对话框探针：列表能为空、能通过「添加描边」新增多行。 */
+    async strokeDialogProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(160, 120))
+      const layer = app.editor.addLayer('测试')
+      openEffectsDialog(app.editor, layer, () => undefined)
+
+      // 每次修改都可能重建容器，所以按整块 .stroke-item 计数、每次都重新查询
+      const rows = (): number =>
+        document.querySelector('.stroke-list')?.querySelectorAll('.stroke-item').length ?? 0
+      const before = rows()
+      const addBtn = [...document.querySelectorAll('.stroke-list button')].find((b) =>
+        (b.textContent ?? '').includes('添加描边'),
+      )
+      const clickAdd = (): void => {
+        const btn = [...document.querySelectorAll('.stroke-list button')].find((b) =>
+          (b.textContent ?? '').includes('添加描边'),
+        )
+        ;(btn as HTMLElement | undefined)?.click()
+      }
+      clickAdd()
+      const one = rows()
+      clickAdd()
+      const two = rows()
+
+      // 整个描边块里的控件（不是某一行）
+      const firstBlock = document.querySelector('.stroke-list .stroke-item')
+      const hasSize = Boolean(firstBlock?.querySelector('input[type=number]'))
+      const hasColor = Boolean(firstBlock?.querySelector('.color-picker-swatch'))
+      const hasDel = [...(firstBlock?.querySelectorAll('button') ?? [])].some((b) =>
+        (b.textContent ?? '').includes('删除'),
+      )
+      const segLabels = [...(firstBlock?.querySelectorAll('.segment-btn') ?? [])].map(
+        (b) => b.textContent ?? '',
+      )
+      const strokes = layer.effects?.strokes?.length ?? 0
+      return {
+        hasList: Boolean(document.querySelector('.stroke-list')),
+        hasAdd: Boolean(
+          [...document.querySelectorAll('.stroke-list button')].find((b) =>
+            (b.textContent ?? '').includes('添加描边'),
+          ),
+        ),
+        before,
+        one,
+        two,
+        hasSize,
+        hasColor,
+        hasDel,
+        segLabels: segLabels.join('|'),
+        segCount: segLabels.length,
+        strokes,
+      }
+    },
+
+    /** 多描边探针：外层描边与内层描边应同时出现在画面上。 */
+    async multiStrokeProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(160, 160))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+      const image = new ImageData(60, 60)
+      for (let i = 0; i < image.data.length; i += 4) {
+        image.data[i] = 255
+        image.data[i + 1] = 255
+        image.data[i + 2] = 255
+        image.data[i + 3] = 255
+      }
+      const layer = app.editor.addImageLayer('方块', image)
+
+      const count = (): { red: number; blue: number } => {
+        app.renderFrame()
+        const img = app.readScreen()
+        let red = 0
+        let blue = 0
+        for (let i = 0; i < img.data.length; i += 4) {
+          const a = img.data[i + 3]!
+          if (a < 200) continue
+          const r = img.data[i]!
+          const g = img.data[i + 1]!
+          const b = img.data[i + 2]!
+          if (r > 150 && g < 90 && b < 90) red++
+          if (b > 150 && r < 90 && g < 90) blue++
+        }
+        return { red, blue }
+      }
+
+      const before = count()
+      app.editor.setEffects(
+        layer.id,
+        (f) => {
+          ;(f as Record<string, unknown>)['strokes'] = [
+            // 外层：8px 红
+            { size: 8, inside: false, color: [1, 0, 0], opacity: 1 },
+            // 内层：4px 蓝（覆盖在红之上，形成同心环）
+            { size: 4, inside: false, color: [0, 0, 1], opacity: 1 },
+          ]
+        },
+        '测试多描边',
+      )
+      const after = count()
+      return {
+        beforeRed: before.red,
+        beforeBlue: before.blue,
+        redPixels: after.red,
+        bluePixels: after.blue,
+        // 直接回报写进去的效果数据，用于区分「没写进去」和「写了但没渲染」
+        effects: JSON.stringify({ strokes: layer.effects?.strokes, stroke: layer.effects?.stroke }),
+        debug: JSON.stringify(
+          (app as unknown as { compositor: { lastEffectDebug: unknown } }).compositor
+            .lastEffectDebug,
+        ),
+      }
+    },
+
+    /** 渐变叠加探针：加一个左黑右白的渐变后，屏幕左半应明显暗于右半。 */
+    async gradientOverlayProbe(): Promise<Record<string, unknown>> {
+      app.editor.replaceDocument(createDocument(160, 120))
+      ;(app as unknown as { fitToWindow(): void }).fitToWindow()
+      const image = new ImageData(100, 60)
+      for (let i = 0; i < image.data.length; i += 4) {
+        image.data[i] = 255
+        image.data[i + 1] = 255
+        image.data[i + 2] = 255
+        image.data[i + 3] = 255
+      }
+      const layer = app.editor.addImageLayer('底', image)
+
+      /** 统计屏幕上「接近纯黑」与「接近纯白」的像素数。
+       *  不能用左右平均亮度：图层只占屏幕一部分，而渐变是相对图层铺开的，
+       *  拿整屏左右平均比会得出误导性的结论。 */
+      const stats = (): { dark: number; light: number } => {
+        app.renderFrame()
+        const img = app.readScreen()
+        let dark = 0
+        let light = 0
+        for (let i = 0; i < img.data.length; i += 4) {
+          const v = (img.data[i]! + img.data[i + 1]! + img.data[i + 2]!) / 3
+          if (v < 30) dark++
+          else if (v > 225) light++
+        }
+        return { dark, light }
+      }
+
+      const before = stats()
+      app.editor.setEffects(
+        layer.id,
+        (f) => {
+          ;(f as Record<string, unknown>)['gradientOverlay'] = {
+            angle: 0,
+            opacity: 1,
+            stops: [
+              { position: 0, color: [0, 0, 0] },
+              { position: 1, color: [1, 1, 1] },
+            ],
+          }
+        },
+        '测试渐变叠加',
+      )
+      const after = stats()
+      return {
+        beforeDark: before.dark,
+        beforeLight: before.light,
+        afterDark: after.dark,
+        afterLight: after.light,
+        // 渐变生效的话，图层应该多出一大片接近纯黑的区域
+        newDark: after.dark - before.dark,
+        debug: JSON.stringify(
+          (app as unknown as { compositor: { lastEffectDebug: unknown } }).compositor
+            .lastEffectDebug,
+        ),
       }
     },
 

@@ -13,6 +13,7 @@
 import {
   ADJUST_FS,
   ALPHA_FS,
+  STROKE_COMPOSE_FS,
   DILATE_FS,
   BLIT_FS,
   BLEND_CODES,
@@ -30,7 +31,8 @@ import {
   TRANSFORM_FS,
   ADJUST_CODES,
 } from './shaders.ts'
-import type { BlendMode, LayerRecord, Manifest, Transform } from '../../shared/types.ts'
+import type { BlendMode, GradientOverlay, LayerRecord, Manifest, Transform } from '../../shared/types.ts'
+import { strokeList } from '../../shared/types.ts'
 
 /** 一个图层的像素载体：可读写、可上传、可编码 PNG。 */
 export interface LayerPixels {
@@ -271,6 +273,7 @@ export class Compositor {
   private blurProgram: Program
   private alphaProgram: Program
   private dilateProgram: Program
+  private strokeComposeProgram: Program
   private effectsProgram: Program
   private padCopyProgram: Program
   private gridProgram: Program
@@ -285,6 +288,12 @@ export class Compositor {
   // canvas 也一并记住：文字图层重绘时可能换成**新的** canvas 对象，
   // 而新对象的 version 会从头计数，仅比较 version 会漏掉这次更新
   // （表现就是「改了没反应 / 打上字没有显示」）。
+  /** 自检用：上一次 renderEffects 的关键中间值（用于诊断「效果为何没出现」）。 */
+  lastEffectDebug: Record<string, unknown> = {}
+
+  /** 渐变叠加用的 256×1 纹理缓存（按图层 id）。 */
+  private gradientCache = new Map<string, { tex: WebGLTexture; key: string }>()
+
   private layerTextures = new Map<
     string,
     { tex: WebGLTexture; version: number; canvas: LayerPixels['canvas'] | null }
@@ -321,6 +330,7 @@ export class Compositor {
     this.blurProgram = link(gl, QUAD_VS, BLUR_FS)
     this.alphaProgram = link(gl, QUAD_VS, ALPHA_FS)
     this.dilateProgram = link(gl, QUAD_VS, DILATE_FS)
+    this.strokeComposeProgram = link(gl, QUAD_VS, STROKE_COMPOSE_FS)
     this.effectsProgram = link(gl, QUAD_VS, EFFECTS_FS)
     this.padCopyProgram = link(gl, QUAD_VS, PAD_COPY_FS)
     this.gridProgram = link(gl, RECT_VS, GRID_FS)
@@ -488,6 +498,50 @@ export class Compositor {
     return b.tex
   }
 
+  /**
+   * 把渐变的停止点画成一张 256×1 的纹理。
+   * 缓存键包含图层 id 与渐变本身，渐变参数一改就会重建。
+   */
+  private gradientTexture(id: string, g: GradientOverlay): WebGLTexture {
+    const key = JSON.stringify(g)
+    const cached = this.gradientCache.get(id)
+    if (cached && cached.key === key) return cached.tex
+
+    const canvas = document.createElement('canvas')
+    canvas.width = 256
+    canvas.height = 1
+    const ctx = canvas.getContext('2d')
+    if (ctx) {
+      const grad = ctx.createLinearGradient(0, 0, 256, 0)
+      const stops = g.stops.length >= 2 ? g.stops : [{ position: 0, color: [0, 0, 0] }, { position: 1, color: [1, 1, 1] }]
+      for (const stop of stops) {
+        const [r = 0, gg = 0, b = 0] = stop.color
+        const rgb = `rgb(${Math.round(r * 255)}, ${Math.round(gg * 255)}, ${Math.round(b * 255)})`
+        // reverse 时把位置镜像，省去另建一张纹理
+        const pos = g.reverse ? 1 - Math.min(1, Math.max(0, stop.position)) : Math.min(1, Math.max(0, stop.position))
+        grad.addColorStop(pos, rgb)
+      }
+      ctx.fillStyle = grad
+      ctx.fillRect(0, 0, 256, 1)
+    }
+
+    const gl = this.gl
+    let tex = cached?.tex
+    if (!tex) {
+      const created = gl.createTexture()
+      if (!created) throw new Error('无法创建渐变纹理')
+      tex = created
+    }
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, canvas)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    this.gradientCache.set(id, { tex, key })
+    return tex
+  }
+
   private blurAlphaInto(
     srcTex: WebGLTexture,
     w: number,
@@ -536,7 +590,15 @@ export class Compositor {
     const fx = layer.effects
     const on = (e?: { enabled?: boolean }): boolean => Boolean(e) && e!.enabled !== false
     const any =
-      fx && (on(fx.stroke) || on(fx.shadow) || on(fx.colorOverlay) || on(fx.innerShadow) || on(fx.outerGlow) || on(fx.innerGlow))
+      fx &&
+      (on(fx.stroke) ||
+        (fx.strokes?.length ?? 0) > 0 ||
+        on(fx.shadow) ||
+        on(fx.colorOverlay) ||
+        on(fx.gradientOverlay) ||
+        on(fx.innerShadow) ||
+        on(fx.outerGlow) ||
+        on(fx.innerGlow))
     if (!any) return null
 
     const key = `${own.version}|${JSON.stringify(fx)}`
@@ -552,6 +614,11 @@ export class Compositor {
     if (on(fx.shadow)) padding = Math.max(padding, fx.shadow!.distance + fx.shadow!.blur)
     if (on(fx.outerGlow)) padding = Math.max(padding, (fx.outerGlow!.size ?? 0) * 2)
     if (on(fx.stroke) && !fx.stroke!.inside) padding = Math.max(padding, fx.stroke!.size * 2)
+    // 描边的留白要取「所有外侧描边里最大的那个」。只看旧的单值字段会算成 0 ——
+    // 那样扩展画布就等于图层本身，膨胀出来的描边整圈被裁掉，画面上一片空白。
+    for (const s of strokeList(fx)) {
+      if (!s.inside) padding = Math.max(padding, s.size * 2)
+    }
     padding = Math.ceil(padding)
 
     const W = w + padding * 2
@@ -586,9 +653,60 @@ export class Compositor {
     const innerGlowBlur = on(fx.innerGlow) ? this.blurAlphaInto(alpha.tex, W, H, fx.innerGlow!.size ?? 0, sink) : alpha.tex
     // 描边用形态学膨胀（实色外扩），而不是模糊 + 阈值（发散、发虚）。
     // 膨胀半径就等于外侧描边的宽度。
-    const strokeBlur = on(fx.stroke)
-      ? this.dilateAlphaInto(alpha.tex, W, H, fx.stroke!.size, sink)
-      : alpha.tex
+    // 描边：多个外侧描边按「先大后小」依次膨胀并叠色，得到一圈圈同心环。
+    // 旧的单值 stroke 由 strokeList() 合并进来 —— 渲染与对话框共用同一套兼容逻辑。
+    // 注意：内侧描边需要「腐蚀」而不是膨胀，与多层合成不是一条路，暂仍按单值处理。
+    const strokes = strokeList(fx).filter((s) => s.size > 0 && !s.inside)
+    const insideStroke = strokeList(fx).find((s) => s.size > 0 && s.inside)
+    // 自检：把这一步看到的东西记下来，探针可据此判断断在哪一段
+    this.lastEffectDebug = {
+      reached: true,
+      fxKeys: Object.keys(fx ?? {}),
+      strokeCount: strokes.length,
+      insideCount: insideStroke ? 1 : 0,
+      strokeSizes: strokes.map((s) => s.size),
+      padding,
+      W,
+      H,
+    }
+    let strokeTex = alpha.tex
+    let strokeIsComposed = false
+    if (strokes.length > 0) {
+      const ordered = [...strokes].sort((a, b) => b.size - a.size)
+      let acc = this.makeTarget(W, H)
+      sink.textures.push(acc.tex)
+      sink.fbos.push(acc.fbo)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, acc.fbo)
+      gl.disable(gl.BLEND)
+      gl.clearColor(0, 0, 0, 0)
+      gl.clear(gl.COLOR_BUFFER_BIT)
+      for (const s of ordered) {
+        const mask = this.dilateAlphaInto(alpha.tex, W, H, s.size, sink)
+        const next = this.makeTarget(W, H)
+        sink.textures.push(next.tex)
+        sink.fbos.push(next.fbo)
+        const sp = this.strokeComposeProgram
+        gl.useProgram(sp.program)
+        gl.activeTexture(gl.TEXTURE0)
+        gl.bindTexture(gl.TEXTURE_2D, acc.tex)
+        gl.uniform1i(sp.uniforms['uPrev']!, 0)
+        gl.activeTexture(gl.TEXTURE1)
+        gl.bindTexture(gl.TEXTURE_2D, mask)
+        gl.uniform1i(sp.uniforms['uMask']!, 1)
+        gl.uniform3fv(sp.uniforms['uColor']!, s.color ?? [0, 0, 0])
+        gl.uniform1f(sp.uniforms['uOpacity']!, s.opacity ?? 1)
+        this.drawFullQuad(W, H, next.fbo)
+        acc = next
+      }
+      gl.bindVertexArray(null)
+      strokeTex = acc.tex
+      strokeIsComposed = true
+      this.lastEffectDebug['composed'] = true
+      this.lastEffectDebug['strokeTexIsAcc'] = strokeTex === acc.tex
+    } else if (insideStroke) {
+      // 内侧描边沿用旧路径（膨胀 + 阈值）
+      strokeTex = this.dilateAlphaInto(alpha.tex, W, H, insideStroke.size, sink)
+    }
 
     // 3) 合成
     const out = this.makeTarget(W, H)
@@ -607,7 +725,8 @@ export class Compositor {
     bind('uGlowBlur', 2, glowBlur)
     bind('uInnerShadowBlur', 3, innerShadowBlur)
     bind('uInnerGlowBlur', 4, innerGlowBlur)
-    bind('uStrokeBlur', 5, strokeBlur)
+    bind('uStrokeBlur', 5, strokeTex)
+    gl.uniform1i(p.uniforms['uStrokeComposed']!, strokeIsComposed ? 1 : 0)
 
     const black: [number, number, number] = [0, 0, 0]
     const white: [number, number, number] = [1, 1, 1]
@@ -616,7 +735,7 @@ export class Compositor {
       const s = fx.shadow!
       const ang = (s.angle * Math.PI) / 180
       gl.uniform1i(p.uniforms['uHasShadow']!, 1)
-      gl.uniform3fv(p.uniforms['uShadowColor']!, s.color ?? black)
+      gl.uniform3fv(p.uniforms['uShadowColor']!, s.color ?? [0, 0, 0])
       gl.uniform1f(p.uniforms['uShadowOpacity']!, s.opacity ?? 0.75)
       gl.uniform2f(
         p.uniforms['uShadowOffset']!,
@@ -636,12 +755,14 @@ export class Compositor {
       gl.uniform1i(p.uniforms['uHasGlow']!, 0)
     }
 
-    if (on(fx.stroke)) {
-      const s = fx.stroke!
+    // 描边：走 strokeList（旧的单值 stroke 也在里面）。
+    // 有外侧描边时用合成结果（strokeIsComposed），内侧单值描边走旧路径。
+    const activeStroke = strokes[0] ?? insideStroke
+    if (activeStroke) {
       gl.uniform1i(p.uniforms['uHasStroke']!, 1)
-      gl.uniform3fv(p.uniforms['uStrokeColor']!, s.color ?? black)
-      gl.uniform1f(p.uniforms['uStrokeOpacity']!, s.opacity ?? 1)
-      gl.uniform1i(p.uniforms['uStrokeInside']!, s.inside ? 1 : 0)
+      gl.uniform3fv(p.uniforms['uStrokeColor']!, activeStroke.color ?? black)
+      gl.uniform1f(p.uniforms['uStrokeOpacity']!, activeStroke.opacity ?? 1)
+      gl.uniform1i(p.uniforms['uStrokeInside']!, activeStroke.inside ? 1 : 0)
     } else {
       gl.uniform1i(p.uniforms['uHasStroke']!, 0)
     }
@@ -655,11 +776,39 @@ export class Compositor {
       gl.uniform1i(p.uniforms['uHasColorOverlay']!, 0)
     }
 
+    if (on(fx.gradientOverlay)) {
+      const g = fx.gradientOverlay!
+      // 诊断：确认这几个 uniform 真的存在（被 GLSL 优化掉的话这里会是 false）
+      this.lastEffectDebug['gradientUniforms'] = {
+        has: Boolean(p.uniforms['uHasGradientOverlay']),
+        tex: Boolean(p.uniforms['uGradientTex']),
+        dir: Boolean(p.uniforms['uGradientDir']),
+        rect: Boolean(p.uniforms['uGradientRect']),
+      }
+      this.lastEffectDebug['gradientActive'] = true
+      // 用 7 号单元：0–5 已被其它效果占用，6 曾出现过取不到的问题
+      bind('uGradientTex', 7, this.gradientTexture(layer.id, g))
+      gl.uniform1i(p.uniforms['uHasGradientOverlay']!, 1)
+      gl.uniform1f(p.uniforms['uGradientOpacity']!, g.opacity ?? 1)
+      const ga = (g.angle * Math.PI) / 180
+      gl.uniform2f(p.uniforms['uGradientDir']!, Math.cos(ga), Math.sin(ga))
+      // 图层在扩展画布里的 UV 区间：内容从 (padding, padding) 开始，尺寸为 w×h
+      gl.uniform4f(
+        p.uniforms['uGradientRect']!,
+        padding / W,
+        padding / H,
+        (padding + w) / W,
+        (padding + h) / H,
+      )
+    } else {
+      gl.uniform1i(p.uniforms['uHasGradientOverlay']!, 0)
+    }
+
     if (on(fx.innerShadow)) {
       const s = fx.innerShadow!
       const ang = (s.angle * Math.PI) / 180
       gl.uniform1i(p.uniforms['uHasInnerShadow']!, 1)
-      gl.uniform3fv(p.uniforms['uInnerShadowColor']!, s.color ?? black)
+      gl.uniform3fv(p.uniforms['uInnerShadowColor']!, s.color ?? [0, 0, 0])
       gl.uniform1f(p.uniforms['uInnerShadowOpacity']!, s.opacity ?? 0.75)
       gl.uniform2f(
         p.uniforms['uInnerShadowOffset']!,

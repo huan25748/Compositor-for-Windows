@@ -347,6 +347,74 @@ function createWindow(): void {
           const dir = join(app.getPath('temp'), `compositor-e2e-${Date.now()}.comp`)
           const problems: string[] = []
           try {
+            // —— 起始页探针：必须最先跑 —— 它会关掉起始页，
+            //    而起始页是全屏遮罩，留着会拦掉后面所有真实鼠标点击。
+            const wcRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.welcomeProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const wc = JSON.parse(wcRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 起始页：存在=${String(wc['present'])} 标题正确=${String(wc['hasTitle'])} 卡片数=${String(wc['cardCount'])} 卡片=${String(wc['titles'])} 快捷键提示=${String(wc['hasKeys'])}`,
+            )
+            if (!wc['present']) problems.push('启动时没有显示起始页')
+            if (!wc['hasTitle']) problems.push('起始页缺少标题')
+            if (Number(wc['cardCount']) !== 3) {
+              problems.push(`起始页应有 3 张卡片（新建 / 打开 / 导入），实际 ${String(wc['cardCount'])}`)
+            }
+            if (!wc['hasKeys']) problems.push('起始页缺少快捷键提示')
+
+            // —— 字重探针：顶栏选择器 + 改字重后宽度变化 ——
+            const fwRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.fontWeightProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const fw = JSON.parse(fwRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 字重：顶栏有选择器=${String(fw['hasWeightLabel'])} 选项数=${String(fw['optionCount'])}；常规尺寸=${String(fw['normal'])} → 900 后=${String(fw['bold'])} 数据=${String(fw['weight'])}`,
+            )
+            if (!fw['hasWeightLabel']) problems.push('文字工具顶栏没有字重选择器')
+            if (Number(fw['optionCount']) < 5) {
+              problems.push(`字重选择器选项太少（${String(fw['optionCount'])} 个）`)
+            }
+            if (Number(fw['weight']) !== 900) problems.push('改字重后图层数据没更新')
+            if (String(fw['bold']) === String(fw['normal'])) {
+              problems.push('改字重后画布上的字形没有任何变化')
+            }
+
+            // —— 文字编辑器字号探针：改字号后编辑框必须跟上 ——
+            const efRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.editorFontProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const ef = JSON.parse(efRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 编辑器字号：初始=${String(ef['before'])}；改整层字号(96)后=${String(ef['afterWhole'])}；再有选区改(24)后=${String(ef['afterRange'])}；图层字号=${String(ef['layerFontSize'])} 图层尺寸=${String(ef['layerSize'])} 编辑框=${String(ef['taRect'])} 行高 编辑框=${String(ef['taLineHeight'])} 画布=${String(ef['canvasLineHeight'])}`,
+            )
+            if (String(ef['afterWhole']) === String(ef['before'])) {
+              problems.push('改整层字号后编辑框字号没变 —— 光标会按旧字号定位')
+            }
+            // 只改选中部分的字号后，编辑框应跟随「光标所在字符」的字号，
+            // 否则拖选时光标会按全程同一字号计算位置
+            if (String(ef['afterRange']) === String(ef['afterWhole'])) {
+              problems.push('只改选中部分字号后编辑框字号没跟上 —— 光标无法精准定位')
+            }
+
+            // —— 新建项目预设探针：比例预设 + 点击填尺寸 ——
+            const npRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.newDocPresetProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const np = JSON.parse(npRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 新建预设：共 ${String(np['count'])} 个（带图标 ${String(np['icons'])}）=${String(np['labels'])}；点 16:9 后尺寸=${String(np['values'])}`,
+            )
+            if (Number(np['count']) !== 5) {
+              problems.push(`新建项目应有 5 个比例预设，实际 ${String(np['count'])} 个`)
+            }
+            if (Number(np['icons']) !== 5) {
+              problems.push('比例预设缺少图标')
+            }
+            if (String(np['values']) !== '1920|1080') {
+              problems.push(`点 16:9 预设没有把尺寸填进输入框（实际 ${String(np['values'])}）`)
+            }
+
             const built = (await win.webContents.executeJavaScript(
               `window.__e2e.buildAndSave(${JSON.stringify(dir)}).then(r => JSON.stringify(r))`,
             )) as string
@@ -789,6 +857,72 @@ function createWindow(): void {
             }
             if (Number(rich['fontRunCount']) !== 1) {
               problems.push('局部字体 run 没有被记录')
+            }
+
+            // —— 渐变纹理探针：纹理本身是否黑→白 ——
+            const gtRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.gradientTextureProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const gt = JSON.parse(gtRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 渐变纹理：左=${String(gt['left'])} 中=${String(gt['mid'])} 右=${String(gt['right'])}`,
+            )
+            if (String(gt['right']).startsWith('0,0,0')) {
+              problems.push('渐变纹理右端仍是黑色 —— createLinearGradient 没有生效')
+            }
+
+            // —— 描边对话框探针：能添加多个描边 ——
+            const sdRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.strokeDialogProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const sd = JSON.parse(sdRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 描边对话框：有列表=${String(sd['hasList'])} 有添加按钮=${String(sd['hasAdd'])} 行数 ${String(sd['before'])}→${String(sd['one'])}→${String(sd['two'])}；首块 大小=${String(sd['hasSize'])} 颜色=${String(sd['hasColor'])} 删除=${String(sd['hasDel'])} 位置=${String(sd['segLabels'])}；数据里 strokes=${String(sd['strokes'])}`,
+            )
+            if (!sd['hasList'] || !sd['hasAdd']) {
+              problems.push('图层效果对话框里没有多描边列表或添加按钮')
+            }
+            if (Number(sd['two']) <= Number(sd['one']) || Number(sd['one']) <= Number(sd['before'])) {
+              problems.push('点「添加描边」没有真的增加一行')
+            }
+            if (!sd['hasSize'] || !sd['hasColor'] || !sd['hasDel']) {
+              problems.push('描边块缺少控件（大小 / 颜色 / 删除）')
+            }
+            // 位置必须是「外侧 / 内侧」两个可选项，而不是一个「内侧」复选框
+            if (Number(sd['segCount']) !== 2 || String(sd['segLabels']) !== '外侧|内侧') {
+              problems.push(`描边位置不是「外侧 / 内侧」两个可选项（实际 ${String(sd['segLabels'])}）`)
+            }
+            if (Number(sd['strokes']) !== 2) {
+              problems.push(`添加两个描边后数据里只有 ${String(sd['strokes'])} 个`)
+            }
+
+            // —— 多描边探针：同心环 ——
+            const msRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.multiStrokeProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const ms = JSON.parse(msRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 多描边：加之前 红=${String(ms['beforeRed'])} 蓝=${String(ms['beforeBlue'])}；加两个描边后 红=${String(ms['redPixels'])} 蓝=${String(ms['bluePixels'])} 数据=${String(ms['effects'])} 诊断=${String(ms['debug'])}`,
+            )
+            if (Number(ms['redPixels']) <= 0) {
+              problems.push('外层描边（红）没有出现')
+            }
+            if (Number(ms['bluePixels']) <= 0) {
+              problems.push('内层描边（蓝）没有出现 —— 多个描边没有叠加')
+            }
+
+            // —— 渐变叠加探针：横向渐变应让屏幕左暗右亮 ——
+            const goRaw = (await win.webContents.executeJavaScript(
+              'window.__e2e.gradientOverlayProbe().then(r => JSON.stringify(r))',
+            )) as string
+            const go = JSON.parse(goRaw) as Record<string, unknown>
+            console.log(
+              `[e2e] 渐变叠加：加之前 暗=${String(go['beforeDark'])} 亮=${String(go['beforeLight'])}；加之后 暗=${String(go['afterDark'])} 亮=${String(go['afterLight'])} 新增暗=${String(go['newDark'])} 诊断=${String(go['debug'])}`,
+            )
+            if (Number(go['newDark']) < 200) {
+              problems.push(
+                `渐变叠加没有生效（新增暗色像素仅 ${String(go['newDark'])}）`,
+              )
             }
 
             // —— PSD 往返探针：导出再读回必须一致 ——

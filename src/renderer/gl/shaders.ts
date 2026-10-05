@@ -344,6 +344,29 @@ void main() {
 }
 `
 
+/**
+ * 描边分层合成：把当前描边的 mask 按颜色画在累积结果之上。
+ * 调用顺序是「先大后小」，所以后画的（更细的）描边覆盖先画的（更粗的），
+ * 结果就是一圈圈同心环 —— 这正是多个描边应有的样子。
+ */
+export const STROKE_COMPOSE_FS = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUV;
+out vec4 fragColor;
+uniform sampler2D uPrev;   // 已累积的描边
+uniform sampler2D uMask;   // 当前描边膨胀后的 alpha
+uniform vec3 uColor;
+uniform float uOpacity;
+void main() {
+  vec4 prev = texture(uPrev, vUV);
+  float m = texture(uMask, vUV).r * uOpacity;
+  // 有遮罩的地方用本层颜色盖上去，否则保留上一层
+  vec3 rgb = mix(prev.rgb, uColor, step(0.001, m));
+  float a = max(prev.a, m);
+  fragColor = vec4(rgb, a);
+}
+`
+
 export const BLUR_FS = /* glsl */ `#version 300 es
 precision highp float;
 in vec2 vUV;
@@ -405,6 +428,7 @@ uniform vec3 uGlowColor;
 uniform float uGlowOpacity;
 
 uniform int uHasStroke;
+uniform int uStrokeComposed;
 uniform vec3 uStrokeColor;
 uniform float uStrokeOpacity;
 uniform int uStrokeInside;
@@ -412,6 +436,14 @@ uniform int uStrokeInside;
 uniform int uHasColorOverlay;
 uniform vec3 uOverlayColor;
 uniform float uOverlayOpacity;
+
+uniform int uHasGradientOverlay;
+uniform sampler2D uGradientTex;
+uniform float uGradientOpacity;
+uniform vec2 uGradientDir;
+/** 图层在 UV 空间里的矩形（x0, y0, x1, y1）。渐变只在这个范围内铺开， */
+/** 否则会把整块扩展画布（含 padding）当作渐变长度，图层内几乎看不出变化。 */
+uniform vec4 uGradientRect;
 
 uniform int uHasInnerShadow;
 uniform vec3 uInnerShadowColor;
@@ -448,9 +480,16 @@ void main() {
 
   // 3) 外侧描边：膨胀后的覆盖减去原覆盖
   if (uHasStroke == 1 && uStrokeInside == 0) {
-    float ea = texture(uStrokeBlur, vUV).r;
-    float ring = clamp(ea - a, 0.0, 1.0) * uStrokeOpacity;
-    acc = over(acc, vec4(uStrokeColor, ring));
+    if (uStrokeComposed == 1) {
+      // 多层描边的合成结果：rgb 是每一层各自的颜色，a 是它们的联合遮罩。
+      // 各层已在合成时按「先大后小」覆盖，这里直接叠上即可。
+      vec4 st = texture(uStrokeBlur, vUV);
+      acc = over(acc, vec4(st.rgb, st.a * uStrokeOpacity));
+    } else {
+      float ea = texture(uStrokeBlur, vUV).r;
+      float ring = clamp(ea - a, 0.0, 1.0) * uStrokeOpacity;
+      acc = over(acc, vec4(uStrokeColor, ring));
+    }
   }
 
   // 4) 图层自身的像素
@@ -459,6 +498,18 @@ void main() {
   // 5) 颜色叠加（保留原有透明度）
   if (uHasColorOverlay == 1) {
     acc = vec4(mix(acc.rgb, uOverlayColor, uOverlayOpacity), acc.a);
+  }
+
+  if (uHasGradientOverlay == 1) {
+    // 先把 UV 换算到「图层自己的 0–1 区间」，再投影到渐变方向上。
+    // 直接用 vUV 不行：它是整块扩展画布（含 padding）的 UV，图层只占中间一块，
+    // 结果就是图层内几乎看不出渐变。斜向还要按投影长度归一化（45° 时只有 ±0.707）。
+    vec2 span = max(uGradientRect.zw - uGradientRect.xy, vec2(0.0001));
+    vec2 uv = (vUV - uGradientRect.xy) / span;
+    vec2 c = uv - 0.5;
+    float t = dot(c, uGradientDir) / (abs(uGradientDir.x) + abs(uGradientDir.y)) + 0.5;
+    vec3 gc = texture(uGradientTex, vec2(clamp(t, 0.0, 1.0), 0.5)).rgb;
+    acc = vec4(mix(acc.rgb, gc, uGradientOpacity), acc.a);
   }
 
   // 6) 内发光：内部且靠近边缘的区域被提亮（screen）

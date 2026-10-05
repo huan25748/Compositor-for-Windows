@@ -5,11 +5,13 @@ import { colorPicker } from './colorpicker.ts'
 import { Editor, type PixelStore } from '../state/editor.ts'
 import {
   BLEND_MODES,
+  strokeList,
   type AdjustmentKind,
   type Adjustment,
   type BlendMode,
   type LayerEffects,
   type LayerRecord,
+  type StrokeEffect,
 } from '../../shared/types.ts'
 
 export interface LayerPanelCallbacks {
@@ -528,6 +530,8 @@ const EFFECT_SPECS: {
   label: string
   numeric: { key: string; label: string; min: number; max: number; step: number }[]
   inside?: boolean
+  /** 渐变叠加：用起止两个颜色代替通用的单色控件。 */
+  gradient?: boolean
 }[] = [
   {
     key: 'shadow',
@@ -556,6 +560,15 @@ const EFFECT_SPECS: {
     inside: true,
   },
   { key: 'colorOverlay', label: '颜色叠加', numeric: [] },
+  {
+    key: 'gradientOverlay',
+    label: '渐变叠加',
+    numeric: [
+      { key: 'angle', label: '角度', min: -180, max: 180, step: 1 },
+      { key: 'opacity', label: '不透明度', min: 0, max: 1, step: 0.05 },
+    ],
+    gradient: true,
+  },
 ]
 
 /**
@@ -602,6 +615,133 @@ export function openEffectsDialog(editor: Editor, layer: LayerRecord, onChanged:
         values[k] = v
       })
       onChanged()
+    }
+
+    // 渐变叠加用起止两个颜色，而不是通用的单色控件（它的值是 stops 数组）
+    if (spec.gradient) {
+      const stops =
+        (values['stops'] as { position: number; color: [number, number, number] }[] | undefined) ??
+        []
+      const setStop = (i: number, hex: string): void => {
+        setKey(
+          'stops',
+          stops.map((s, n) => (n === i ? { ...s, color: hexToRgb01(hex) } : s)),
+        )
+      }
+      const pairs: [number, string][] = [
+        [0, '起点颜色'],
+        [1, '终点颜色'],
+      ]
+      for (const [i, label] of pairs) {
+        const c = stops[i]?.color ?? [0, 0, 0]
+        const picker = colorPicker({
+          value: rgb01ToHex(c[0], c[1], c[2]),
+          onChange: (hex) => setStop(i, hex),
+        })
+        if (!enabled) {
+          picker.root.style.pointerEvents = 'none'
+          picker.root.style.opacity = '0.5'
+        }
+        body.push(el('div', { class: 'prop-row' }, [el('label', { text: `　${label}` }), picker.root]))
+      }
+    }
+
+    // 描边：支持任意多个。专用分支 —— 每个描边一行（大小 / 颜色 / 内侧 / 删除），
+    // 底部可继续添加。改完只重绘这一个容器，不重建整个对话框。
+    if (key === 'stroke') {
+      const box = el('div', { class: 'stroke-list' })
+      const write = (next: StrokeEffect[], label: string): void => {
+        editor.setEffects(
+          layer.id,
+          (f) => {
+            // 统一迁到 strokes：避免旧的单值字段与新数组同时存在、互相干扰
+            f.strokes = next
+            delete f.stroke
+          },
+          label,
+        )
+        onChanged()
+        paint()
+      }
+      const paint = (): void => {
+        clear(box)
+        const list = strokeList(bag() as unknown as LayerEffects)
+        list.forEach((s, i) => {
+          const card = el('div', { class: 'stroke-item' })
+          // 标题行：编号 + 删除
+          const head = el('div', { class: 'stroke-head' })
+          head.append(
+            el('span', { class: 'stroke-title', text: `描边 ${i + 1}` }),
+            el('button', {
+              class: 'btn',
+              text: '删除',
+              title: `删除第 ${i + 1} 个描边`,
+              onClick: () => write(list.filter((_, n) => n !== i), '删除描边'),
+            }),
+          )
+
+          // 位置：外侧 / 内侧，用分段按钮（比一个「内侧」复选框直观）
+          const posRow = el('div', { class: 'prop-row' })
+          const segment = el('div', { class: 'segment' })
+          for (const [inside, label] of [
+            [false, '外侧'],
+            [true, '内侧'],
+          ] as [boolean, string][]) {
+            segment.append(
+              el('button', {
+                class: s.inside === inside ? 'segment-btn on' : 'segment-btn',
+                text: label,
+                onClick: () =>
+                  write(
+                    list.map((x, n) => (n === i ? { ...x, inside } : x)),
+                    '修改描边位置',
+                  ),
+              }),
+            )
+          }
+          posRow.append(el('label', { text: '位置' }), segment)
+
+          // 大小 + 颜色
+          const sizeRow = el('div', { class: 'prop-row' })
+          const size = numberInput(s.size, { min: 0, max: 500, step: 1 })
+          size.addEventListener('change', () =>
+            write(
+              list.map((x, n) => (n === i ? { ...x, size: Math.max(0, Number(size.value)) } : x)),
+              '修改描边',
+            ),
+          )
+          sizeRow.append(el('label', { text: '大小' }), size)
+
+          const [r = 0, g = 0, b = 0] = s.color ?? [0, 0, 0]
+          const picker = colorPicker({
+            value: rgb01ToHex(r, g, b),
+            onChange: (hex) =>
+              write(
+                list.map((x, n) => (n === i ? { ...x, color: hexToRgb01(hex) } : x)),
+                '修改描边颜色',
+              ),
+          })
+          sizeRow.append(el('label', { text: '颜色' }), picker.root)
+
+          card.append(head, posRow, sizeRow)
+          box.append(card)
+        })
+        box.append(
+          el('button', {
+            class: 'btn',
+            text: '+ 添加描边',
+            onClick: () =>
+              write(
+                [...list, { size: 3, inside: false, color: [0, 0, 0], opacity: 1 }],
+                '添加描边',
+              ),
+          }),
+        )
+      }
+      body.push(el('div', { class: 'prop-row' }, [el('label', { text: spec.label }), toggle]))
+      paint()
+      body.push(box)
+      continue
     }
 
     if ('color' in values) {

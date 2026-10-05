@@ -14,6 +14,8 @@ import type { TextMetadata } from '../shared/types.ts'
 export interface CharStyle {
   fontName: string
   fontSize: number
+  /** CSS font-weight；用于从同一字体族里挑出对应字重。 */
+  fontWeight: number
   red: number
   green: number
   blue: number
@@ -24,7 +26,10 @@ type SpacedContext = OffscreenCanvasRenderingContext2D & { letterSpacing?: strin
 
 /** 构造某个样式的 canvas font 字符串。 */
 function fontFor(style: CharStyle): string {
-  return `${style.fontSize}px "${style.fontName}", "Microsoft YaHei UI", "PingFang SC", sans-serif`
+  // 族名后面交给 font-weight：同一字体族往往打包了多种字重，
+  // 而 CSS 只能按「族名 + 字重」去选（写全名如「…105 Heavy」是无效的）。
+  const weight = style.fontWeight && style.fontWeight !== 400 ? `${style.fontWeight} ` : ''
+  return `${weight}${style.fontSize}px "${style.fontName}", "Microsoft YaHei UI", "PingFang SC", sans-serif`
 }
 
 /** 把上下文设成某个字符的字体与字距。 */
@@ -43,6 +48,7 @@ function sameStyle(a: CharStyle, b: CharStyle): boolean {
   return (
     a.fontName === b.fontName &&
     a.fontSize === b.fontSize &&
+    a.fontWeight === b.fontWeight &&
     a.red === b.red &&
     a.green === b.green &&
     a.blue === b.blue
@@ -57,6 +63,7 @@ export function charStyles(text: TextMetadata): CharStyle[] {
     out.push({
       fontName: text.fontName,
       fontSize: text.fontSize,
+      fontWeight: text.fontWeight ?? 400,
       red: text.red,
       green: text.green,
       blue: text.blue,

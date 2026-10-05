@@ -37,7 +37,15 @@ const SHAPE_LABEL: Record<ShapeKind, string> = {
 /** 新建文字时用到的样式子集（其余字段由文字内容与测量决定）。 */
 export type TextStyle = Pick<
   TextMetadata,
-  'fontName' | 'fontSize' | 'red' | 'green' | 'blue' | 'alignment' | 'tracking' | 'lineSpacing'
+  | 'fontName'
+  | 'fontSize'
+  | 'fontWeight'
+  | 'red'
+  | 'green'
+  | 'blue'
+  | 'alignment'
+  | 'tracking'
+  | 'lineSpacing'
 >
 
 /** 像素的历史快照。 */
@@ -868,6 +876,14 @@ export class Editor {
       opacity: 0.75,
     }),
     colorOverlay: () => ({ color: [1, 0, 0] as [number, number, number], opacity: 1 }),
+    gradientOverlay: () => ({
+      angle: 90,
+      opacity: 1,
+      stops: [
+        { position: 0, color: [0, 0, 0] as [number, number, number] },
+        { position: 1, color: [1, 1, 1] as [number, number, number] },
+      ],
+    }),
     innerShadow: () => ({
       angle: 120,
       distance: 3,

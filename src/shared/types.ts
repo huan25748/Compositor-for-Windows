@@ -214,13 +214,41 @@ export interface SimpleEffect extends EffectCommon {
 }
 
 /** 图层效果：只写出该图层真正拥有的效果。 */
+/** 渐变叠加：在图层范围内按指定角度填充一个线性渐变。 */
+export interface GradientOverlay {
+  enabled?: boolean
+  opacity?: number
+  /** 渐变方向（度，0 = 从左到右）。 */
+  angle: number
+  /** 至少两个停止点，position 为 0–1。 */
+  stops: { position: number; color: [number, number, number] }[]
+  /** 反向。 */
+  reverse?: boolean
+}
+
 export interface LayerEffects {
+  /** 单个描边（旧字段，仍会读入并与 strokes 合并）。 */
   stroke?: StrokeEffect
+  /** 多个描边：按数组顺序从外到内叠加，每个可独立设置大小 / 颜色 / 内外侧。 */
+  strokes?: StrokeEffect[]
   shadow?: ShadowEffect
   colorOverlay?: EffectCommon
+  gradientOverlay?: GradientOverlay
   innerShadow?: ShadowEffect
   outerGlow?: SimpleEffect
   innerGlow?: SimpleEffect
+}
+
+/**
+ * 把 effects 里的描边统一成数组：旧的单值 `stroke` 视为数组的第一个元素。
+ * 渲染与对话框都走这个函数，避免两处各自处理兼容。
+ */
+export function strokeList(effects: LayerEffects | undefined): StrokeEffect[] {
+  if (!effects) return []
+  const list: StrokeEffect[] = []
+  if (effects.stroke) list.push(effects.stroke)
+  if (effects.strokes) list.push(...effects.strokes)
+  return list
 }
 
 /** 文字图层元数据。 */
@@ -263,6 +291,12 @@ export interface TextMetadata {
   alignment: 'left' | 'center' | 'right'
   tracking: number
   lineSpacing: number
+  /**
+   * 字重（CSS font-weight：100–900，缺省 400）。
+   * 同一字体族往往打包了多种字重（如「阿里巴巴普惠体 3.0」的 Thin/Regular/Medium/Bold…），
+   * 而 CSS 只能按族名 + 字重去选，故单列一个字段。
+   */
+  fontWeight?: number
   boxSize?: [number, number]
   colorRuns?: ColorRun[]
   fontRuns?: FontRun[]
