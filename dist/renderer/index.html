@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'" />
+    <title>Compositor</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app" aria-busy="true">
+      <!-- 顶部：工具选项栏 -->
+      <header class="options-bar" id="optionsBar"></header>
+
+      <div class="workbench">
+        <!-- 左侧：工具栏 -->
+        <nav class="toolbar" id="toolbar" aria-label="工具"></nav>
+
+        <!-- 中间：画布 -->
+        <main class="canvas-host" id="canvasHost">
+          <canvas id="glcanvas" class="gl-canvas"></canvas>
+          <div class="rulers" id="rulers" hidden></div>
+          <!-- 左右 / 上下滚动条：拖动滑块或点击轨道即可调整画布的显示位置 -->
+          <div class="scroll-bars" id="scrollBars">
+            <div class="scroll-track scroll-track-h" id="scrollTrackH">
+              <div class="scroll-thumb" id="scrollThumbH"></div>
+            </div>
+            <div class="scroll-track scroll-track-v" id="scrollTrackV">
+              <div class="scroll-thumb" id="scrollThumbV"></div>
+            </div>
+          </div>
+          <div class="canvas-hint" id="canvasHint">从「文件 → 新建」开始，或拖入图像</div>
+          <div class="drop-overlay" id="dropOverlay" hidden>松开以导入图像</div>
+        </main>
+
+        <!-- 右侧：图层面板 + 属性 -->
+        <aside class="side" id="side">
+          <section class="panel layers-panel">
+            <div class="panel-head">
+              <span class="panel-title">图层</span>
+              <span class="panel-count" id="layerCount"></span>
+            </div>
+            <div class="panel-sub" id="blendRow">
+              <label class="sr-only" for="blendMode">混合模式</label>
+              <select id="blendMode" class="select"></select>
+              <label class="sr-only" for="layerOpacity">不透明度</label>
+              <div class="num-field opacity-field">
+                <input id="layerOpacity" class="opacity-input" type="number" min="0" max="100" step="1" value="100" />
+                <div class="num-steps">
+                  <button class="num-step" type="button" data-dir="1" title="增加 1">▲</button>
+                  <button class="num-step" type="button" data-dir="-1" title="减少 1">▼</button>
+                </div>
+              </div>
+              <span class="pct">%</span>
+            </div>
+            <div class="layer-list" id="layerList" role="tree" aria-label="图层列表"></div>
+            <div class="panel-foot" id="layerActions"></div>
+          </section>
+
+          <section class="panel props-panel" id="propsPanel">
+            <div class="panel-head"><span class="panel-title" id="propsTitle">属性</span></div>
+            <div class="props-body" id="propsBody"></div>
+          </section>
+        </aside>
+      </div>
+
+      <!-- 底部：状态栏 -->
+      <footer class="status-bar">
+        <span id="statusTool">未选择工具</span>
+        <span class="spacer"></span>
+        <span id="statusZoom">100%</span>
+        <span id="statusDoc">—</span>
+        <span id="statusMsg"></span>
+      </footer>
+    </div>
+
+    <!-- 对话层 -->
+    <div class="modal-root" id="modalRoot" hidden></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

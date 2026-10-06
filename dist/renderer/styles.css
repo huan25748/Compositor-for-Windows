@@ -1,0 +1,1460 @@
+/* Compositor for Windows —— 深色界面，中文排版
+ *
+ * 令牌体系参照 Morupixel 的设计系统（docs/DESIGN_SYSTEM.md），三条原则：
+ *   1. 图像是主角：UI 一律中性灰，退到后面；屏幕上最亮的应当是被编辑的图像。
+ *   2. 用表面深度表示结构：底 → 面板卡 → 按钮（比面板亮）→ 输入框（比面板暗），
+ *      线条只在需要辅助这个区分时才用。
+ *   3. 蓝色只用于状态：--accent 是"选择 / 焦点 / 进度"的淡蓝，--primary 是每屏
+ *      唯一主动作按钮的深蓝。两者都不拿来做装饰。
+ */
+
+:root {
+  /* —— 表面层次（由暗到亮）—— */
+  --bg: #111317; /* 最底层：窗口背景 */
+  --bg-panel: #1c1f24; /* 面板卡片、悬浮卡片 */
+  --bg-panel-2: #2d323a; /* 按钮、选中的分段（比面板亮） */
+  --bg-sunken: #101216; /* 输入框、分段轨道（比面板暗） */
+  --stage: #15181d; /* 文档背后的工作台 */
+
+  /* —— 分隔与描边 —— */
+  --line: #2a2f37; /* 区域之间的细分隔线、卡片边框 */
+  --line-soft: #24282f; /* 更弱的内部线 */
+  --stroke: #3b414b; /* 输入框、控件的外框 */
+
+  /* —— 文字层次 —— */
+  --text: #e8ebf0; /* 正文 */
+  --text-dim: #a3abb7; /* 次要标签 */
+  --text-mute: #6f7784; /* 说明、禁用态 */
+
+  /* —— 状态色（蓝只用于状态，不做装饰）—— */
+  --accent: #a8caff; /* 选择、焦点、进度 */
+  --accent-ink: #7ba3e0; /* 淡蓝在浅底上的可读版本 */
+  --primary: #3a6fdb; /* 每屏唯一主动作按钮 */
+  --primary-hover: #4a7fe9;
+  --selected: #243857; /* 选中的行 / 工具背景 */
+  --row-hover: #252930; /* 列表行悬停 */
+  --danger: #f07178;
+  --success: #6fd49a;
+  --warning: #e9c46a;
+
+  /* 兼容旧名：早期样式大量引用 --accent-dim 作为「选中底色」 */
+  --accent-dim: #243857;
+  --checker-a: #2a2c31;
+  --checker-b: #232529;
+
+  /* —— 字号（整数，避免离开 hinting 网格）—— */
+  --fs-caption: 12px; /* 说明、输入框上的标签、状态栏 */
+  --fs-body: 13px; /* 正文、按钮、菜单、标签页 */
+  --fs-heading: 14px; /* 属性面板里的对象名 */
+  --fs-title: 18px; /* 对话框、起始页标题 */
+
+  /* —— 尺寸 —— */
+  --h-control: 30px; /* 常规按钮、输入框 */
+  --h-compact: 28px; /* 选项栏、密集行 */
+  --h-layer: 40px; /* 图层行 */
+  --h-action: 34px; /* 属性面板的动作行（下限） */
+  --row-h: 34px; /* 兼容旧名 */
+
+  /* —— 圆角与间距 —— */
+  --r-card: 10px;
+  --r-control: 6px;
+  --r-chip: 4px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+
+  --font: 'Microsoft YaHei UI', 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', system-ui, sans-serif;
+  --font-mono: 'Cascadia Mono', 'Consolas', 'Courier New', monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/*
+ * 关键兜底：下面的覆盖层用的是 display:grid，而作者样式表里的 display
+ * 会盖掉浏览器对 hidden 属性的默认 display:none（两者特异性相同，但作者样式优先）。
+ * 没有这条，拖放提示层和模态遮罩会永远盖在界面上 —— 遮罩还会拦掉所有鼠标操作。
+ */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 12.5px;
+  user-select: none;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.app {
+  display: grid;
+  grid-template-rows: 34px 1fr 24px;
+  height: 100vh;
+}
+
+/* —— 顶部工具选项栏 —— */
+.options-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.options-bar .opt-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.options-bar .opt-label {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.options-bar .divider {
+  width: 1px;
+  height: 18px;
+  background: var(--line);
+}
+
+/* —— 工作区 —— */
+.workbench {
+  display: grid;
+  grid-template-columns: 44px 1fr 292px;
+  min-height: 0;
+}
+
+.toolbar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 0;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+}
+
+.tool-btn {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.tool-btn:hover {
+  background: var(--bg-panel-2);
+  color: var(--text);
+}
+
+.tool-btn.active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.tool-btn svg {
+  width: 19px;
+  height: 19px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.toolbar .sep {
+  width: 22px;
+  height: 1px;
+  margin: 4px 0;
+  background: var(--line);
+}
+
+/* —— 画布 —— */
+.canvas-host {
+  position: relative;
+  overflow: hidden;
+  background:
+    linear-gradient(45deg, var(--checker-a) 25%, transparent 25%) -8px 0 / 16px 16px,
+    linear-gradient(-45deg, var(--checker-a) 25%, transparent 25%) -8px 0 / 16px 16px,
+    linear-gradient(45deg, transparent 75%, var(--checker-a) 75%) -8px 0 / 16px 16px,
+    linear-gradient(-45deg, transparent 75%, var(--checker-a) 75%) -8px 0 / 16px 16px,
+    var(--checker-b);
+  /* 指针按当前工具走：变量由 JS 写（见 ui/cursors.ts）。
+     平移拖动时 `.panning` 的规则更具体，会盖过这里变成 grabbing。 */
+  cursor: var(--tool-cursor, crosshair);
+}
+
+.canvas-host.panning {
+  cursor: grabbing;
+}
+
+.gl-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.canvas-hint {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-mute);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 10px;
+  border: 2px dashed var(--accent);
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: rgba(76, 141, 255, 0.08);
+  color: var(--text);
+  font-size: 14px;
+  pointer-events: none;
+}
+
+/* 标尺：从标尺拖出即可创建参考线 */
+.rulers {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.ruler {
+  position: absolute;
+  display: block;
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+.ruler-top {
+  top: 0;
+  left: 20px;
+}
+
+.ruler-left {
+  top: 20px;
+  left: 0;
+}
+
+/* 画布区右下角的左右 / 上下滚动条：拖动滑块或点击轨道即可调整画布显示位置 */
+.scroll-bars {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.scroll-track {
+  position: absolute;
+  pointer-events: auto;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.26);
+}
+
+/* 两条各让开一个身位，免得右下角互相压住 */
+.scroll-track-h {
+  left: 0;
+  right: 12px;
+  bottom: 0;
+  height: 10px;
+}
+
+.scroll-track-v {
+  top: 0;
+  bottom: 12px;
+  right: 0;
+  width: 10px;
+}
+
+.scroll-thumb {
+  position: absolute;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.26);
+  transition: background 0.12s ease;
+}
+
+/* 滑块长度与位置由 JS 按「视口 / 内容」的比例写进 inline style */
+.scroll-track-h .scroll-thumb {
+  top: 0;
+  height: 100%;
+}
+
+.scroll-track-v .scroll-thumb {
+  left: 0;
+  width: 100%;
+}
+
+.scroll-track:hover .scroll-thumb {
+  background: rgba(255, 255, 255, 0.44);
+}
+
+/* 文字图层的画布内联编辑器 */
+.text-editor {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  /* 用 outline 而不是 border：box-sizing 是 border-box，border 会把内容区
+     往里挤 1px，导致输入框里的字与画布上渲染出来的字对不齐 */
+  border: none;
+  outline: 1px dashed var(--accent);
+  /* 不要背景：编辑器只提供光标和虚线轮廓就够了。
+     否则输入时那块底色会与最终渲染出来的文字对不上。 */
+  background: transparent;
+  resize: none;
+  overflow: hidden;
+  /* 编辑期间不换行：画布上的文字也按单行渲染，换行会让光标与文字对不上 */
+  white-space: pre;
+  z-index: 5;
+  caret-color: var(--accent);
+  /* 让 textarea 里的字不可见：用户看到的是画布上实时渲染的文字，
+     编辑器只负责接收输入、显示光标。否则两套字体度量有微小差异，
+     叠在一起就成了「重影 / 被拉长」的样子。 */
+  color: transparent;
+}
+
+/* 选中文字用主题蓝，避免出现一大块浅色底 */
+.text-editor::selection {
+  background: rgba(76, 141, 255, 0.45);
+}
+
+/* —— 右侧面板 —— */
+.side {
+  display: grid;
+  grid-template-rows: minmax(180px, 1fr) auto;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--line);
+  min-height: 0;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px 6px;
+}
+
+.panel-title {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.panel-count {
+  color: var(--text-mute);
+  font-size: 11px;
+}
+
+.panel-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 8px;
+}
+
+.panel-foot {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 6px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.select {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  color: var(--text);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.opacity-input {
+  width: 46px;
+  height: 24px;
+  padding: 0 4px;
+  text-align: right;
+  color: var(--text);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.pct {
+  color: var(--text-mute);
+}
+
+.layer-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 6px 6px;
+}
+
+.layer-row {
+  display: grid;
+  grid-template-columns: 18px 30px 1fr auto;
+  align-items: center;
+  gap: 6px;
+  height: var(--row-h);
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: default;
+}
+
+.layer-row:hover {
+  background: var(--bg-panel-2);
+}
+
+.layer-row.selected {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.layer-row.active .layer-name {
+  font-weight: 600;
+}
+
+.layer-row.dragging {
+  opacity: 0.5;
+}
+
+.layer-row.drop-above {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.layer-row.drop-below {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.layer-row.drop-inside {
+  border-color: var(--accent);
+}
+
+.layer-eye {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+}
+
+.layer-eye.off {
+  color: #4a4f57;
+}
+
+.layer-eye svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+}
+
+.layer-thumb {
+  width: 30px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background:
+    linear-gradient(45deg, #33363c 25%, transparent 25%) 0 0 / 8px 8px,
+    linear-gradient(-45deg, #33363c 25%, transparent 25%) 0 0 / 8px 8px,
+    #2a2c31;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+}
+
+.layer-thumb img,
+.layer-thumb canvas {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+}
+
+.layer-thumb .mask-mark {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+.layer-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.layer-name .indent {
+  color: var(--text-mute);
+}
+
+.layer-badges {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+  color: var(--text-mute);
+  font-size: 10px;
+}
+
+.badge {
+  padding: 0 4px;
+  height: 15px;
+  line-height: 15px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.rename-input {
+  width: 100%;
+  height: 22px;
+  padding: 0 4px;
+  color: var(--text);
+  background: var(--bg-sunken);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12.5px;
+}
+
+.icon-btn {
+  width: 26px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: var(--bg-panel-2);
+  color: var(--text);
+}
+
+.icon-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.icon-btn svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* —— 属性面板 —— */
+.props-panel {
+  max-height: 46%;
+}
+
+.props-body {
+  overflow-y: auto;
+  padding: 0 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.prop-row {
+  display: grid;
+  grid-template-columns: 76px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.prop-row > label {
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.prop-row input[type='number'],
+.prop-row input[type='text'],
+.prop-row select {
+  width: 100%;
+  height: 24px;
+  padding: 0 6px;
+  color: var(--text);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.prop-row input[type='range'] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.prop-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.prop-hint {
+  color: var(--text-mute);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.empty-note {
+  color: var(--text-mute);
+  font-size: 11.5px;
+  padding: 8px 2px;
+}
+
+/* —— 状态栏 —— */
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 10px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--line);
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.status-bar .spacer {
+  flex: 1;
+}
+
+#statusMsg {
+  color: var(--accent);
+}
+
+/* —— 模态框 —— */
+.modal-root {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 40;
+}
+
+.modal {
+  width: min(460px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+}
+
+.modal h2 {
+  margin: 0;
+  padding: 14px 16px 10px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.modal .modal-body {
+  padding: 0 16px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.modal .modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 16px 16px;
+}
+
+.btn {
+  height: 28px;
+  padding: 0 14px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg-panel-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.btn:hover {
+  border-color: #4a4f57;
+}
+
+.btn.primary {
+  /* 主按钮：每屏唯一的主动作用 --primary 深蓝；
+     --accent 的淡蓝只留给选择/焦点/进度这类状态显示 */
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.btn.primary:hover {
+  background: var(--primary-hover);
+}
+
+.btn.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.field {
+  display: grid;
+  grid-template-columns: 92px 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.field > label {
+  color: var(--text-dim);
+}
+
+.field input[type='number'],
+.field input[type='text'],
+.field select {
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  color: var(--text);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 12.5px;
+}
+
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.preset {
+  padding: 10px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-panel-2);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  text-align: center;
+}
+
+.preset:hover {
+  border-color: var(--accent);
+}
+
+.error-box {
+  background: rgba(229, 83, 75, 0.12);
+  border: 1px solid rgba(229, 83, 75, 0.4);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: #ffb4b0;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+/* 诊断信息：等宽、可选中，方便复制粘贴 */
+.diag {
+  margin: 0;
+  max-height: 46vh;
+  overflow: auto;
+  padding: 8px 10px;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-dim);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  user-select: text;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  background: var(--bg-panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 12.5px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  z-index: 50;
+  pointer-events: none;
+}
+
+/* —— 自绘字体选择器 ——
+ * 按钮与每个列表项都用各自的字体渲染。原生 <select> 做不到这点：
+ * Windows 上它的绘制由系统接管，给 select / option 设 font-family 都不生效。 */
+.font-picker {
+  position: relative;
+  display: inline-block;
+}
+
+.font-picker-btn {
+  min-width: 200px;
+  max-width: 300px;
+  height: var(--h-control);
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-size: var(--fs-body);
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.font-picker-btn:hover {
+  border-color: var(--accent);
+}
+
+.font-picker-panel {
+  position: fixed;
+  z-index: 40;
+  top: calc(100% + 4px);
+  left: 0;
+  width: 340px;
+  padding: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--bg-panel);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 45%);
+}
+
+.font-picker-panel[hidden] {
+  display: none !important;
+}
+
+.font-picker-search {
+  width: 100%;
+  height: var(--h-compact);
+  margin-bottom: var(--sp-2);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-size: var(--fs-body);
+}
+
+.font-picker-search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.font-picker-list {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.font-picker-row {
+  display: block;
+  width: 100%;
+  height: 30px;
+  padding: 0 var(--sp-2);
+  border: none;
+  border-radius: var(--r-chip);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--fs-body);
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.font-picker-row:hover,
+.font-picker-row:focus {
+  outline: none;
+  background: var(--row-hover);
+}
+
+.font-picker-row.current {
+  background: var(--selected);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.font-picker-more {
+  padding: var(--sp-2);
+  color: var(--text-mute);
+  font-size: var(--fs-caption);
+}
+
+/* —— 数字 / 文本输入的统一外观 ——
+ * 浏览器默认给 number 输入加了高度不一的上下箭头，聚焦时还用系统描边
+ * （浅色系统主题下是橙黄色），和深色界面完全不搭。这里统一到设计令牌。
+ * 注意：不要靠 .prop-row / .field 限制作用域 —— 选项栏里的输入框不在其中，
+ * 之前正是因为只写了那两处，选项栏才一直是「原始」外观。 */
+input[type='number'],
+input[type='text'] {
+  height: var(--h-control);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-body);
+}
+
+input[type='number']:focus,
+input[type='text']:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 恢复数字输入的上下箭头。
+ * 原来的 appearance: textfield 会连带把箭头隐藏掉 —— 而那正是「点了没反应」的来源：
+ * 样式统一了，但少了一个常用操作。这里不再设它（边框与背景已由上面的规则指定，
+ * 不依赖它来「去原生外观」），箭头用透明度压低对比度，免得在深色界面上过于刺眼。 */
+input[type='number'] {
+  /* 纯黑底：与画布区的底色一致，比面板色更「凹」，也压掉系统外观可能带的高光 */
+  background-color: #000;
+}
+
+input[type='number']::-webkit-inner-spin-button {
+  /* 就用原生箭头，只把颜色反过来变成白色（CSS filter 对伪元素生效）。
+     注意不要自绘箭头再把它设成透明：那样背景图不能点、原生又不可见，两个都点不了。 */
+  filter: invert(1);
+  opacity: 0.9;
+  cursor: pointer;
+}
+
+input[type='number']::-webkit-inner-spin-button:hover {
+  opacity: 1;
+}
+
+/* —— 滚动条 ——
+ * 默认滚动条是浅色主题的粗白条，还带上下三角按钮，在深色界面里非常突兀。 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 5px;
+  background: #39404a;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4a525e;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* 去掉上下三角按钮 */
+::-webkit-scrollbar-button {
+  display: none;
+}
+
+/* —— 范围滑块 ——
+ * 不用 accent-color：那只是让控件套用系统外观（粗轨道 + 大圆块），风格无法统一。
+ * 这里用 appearance: none 完全接管轨道与滑块。 */
+input[type='range'] {
+  appearance: none;
+  width: 100%;
+  height: 18px;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-sunken);
+  box-shadow: inset 0 0 0 1px var(--stroke);
+}
+
+input[type='range']::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+input[type='range']:focus {
+  outline: none;
+}
+
+input[type='range']:focus::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--selected);
+}
+
+/* —— 颜色选择器 ——
+ * 原生控件自带一圈白色粗边框和内边距，和深色界面完全不搭。 */
+input[type='color'] {
+  width: 46px;
+  height: var(--h-control);
+  padding: 0;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  cursor: pointer;
+}
+
+input[type='color']:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+input[type='color']::-webkit-color-swatch-wrapper {
+  padding: 3px;
+}
+
+input[type='color']::-webkit-color-swatch {
+  border: none;
+  border-radius: 3px;
+}
+
+/* —— 自绘颜色选择器 ——
+ * 原生 <input type="color"> 的取色面板由系统绘制，会弹出一个浅色窗口，
+ * 与深色界面风格割裂，因此自己画：饱和度/明度方块 + 色相条 + 十六进制输入。 */
+.color-picker {
+  position: relative;
+  display: inline-block;
+}
+
+.color-picker-swatch {
+  width: 46px;
+  height: var(--h-control);
+  padding: 3px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  /* 让 paint() 写入的纯色只填内容区，留下 3px 内衬，色块不会顶到边框 */
+  background-clip: content-box;
+  cursor: pointer;
+}
+
+.color-picker-swatch:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.color-picker-panel {
+  position: fixed;
+  z-index: 41;
+  width: 184px;
+  padding: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--bg-panel);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 45%);
+}
+
+.color-picker-panel[hidden] {
+  display: none !important;
+}
+
+.color-picker-sv {
+  display: block;
+  width: 168px;
+  height: 120px;
+  border-radius: var(--r-chip);
+  cursor: crosshair;
+}
+
+.color-picker-hue {
+  position: relative;
+  height: 12px;
+  margin-top: var(--sp-2);
+  border-radius: 6px;
+  background: linear-gradient(90deg, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);
+  cursor: pointer;
+}
+
+.color-picker-hue-knob {
+  position: absolute;
+  top: -2px;
+  width: 4px;
+  height: 16px;
+  margin-left: -2px;
+  border: 1px solid #fff;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 50%);
+}
+
+.color-picker-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+
+.color-picker-preview {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-chip);
+}
+
+.color-picker-hex {
+  flex: 1;
+  min-width: 0;
+  height: var(--h-compact);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+}
+
+.color-picker-hex:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* —— 描边列表 ——
+ * 每个描边一个独立小块：标题行（编号 + 删除）、位置（外侧/内侧分段）、大小与颜色。
+ * 原先把 5 个控件塞在一行里，既挤又看不出「内侧」这个复选框在管什么。 */
+.stroke-list {
+  display: grid;
+  gap: var(--sp-2);
+  margin: var(--sp-2) 0;
+}
+
+.stroke-item {
+  padding: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+}
+
+.stroke-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--sp-2);
+}
+
+.stroke-title {
+  color: var(--text-dim);
+  font-size: var(--fs-body);
+}
+
+.segment {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+}
+
+.segment-btn {
+  min-width: 54px;
+  height: 22px;
+  padding: 0 var(--sp-2);
+  border: none;
+  border-radius: var(--r-chip);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: var(--fs-caption);
+  cursor: pointer;
+}
+
+.segment-btn:hover {
+  color: var(--text);
+}
+
+.segment-btn.on {
+  background: var(--selected);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* —— 起始页 ——
+ * 启动后先看到它；新建 / 打开 / 导入之后才进入工作区。 */
+.welcome {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+}
+
+.welcome-inner {
+  display: grid;
+  gap: 32px;
+  justify-items: center;
+  width: min(780px, calc(100% - 64px));
+}
+
+.welcome-brand {
+  text-align: center;
+}
+
+.welcome-title {
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--text);
+}
+
+.welcome-sub {
+  margin-top: 6px;
+  font-size: var(--fs-heading);
+  color: var(--text-dim);
+}
+
+.welcome-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-3);
+  width: 100%;
+}
+
+.welcome-card {
+  display: grid;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--bg-panel);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.welcome-card:hover {
+  border-color: var(--accent);
+  background: var(--bg-panel-2);
+}
+
+.welcome-card-icon svg {
+  width: 28px;
+  height: 28px;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.welcome-card-title {
+  display: block;
+  font-size: var(--fs-heading);
+}
+
+.welcome-card-desc {
+  display: block;
+  margin-top: 4px;
+  font-size: var(--fs-caption);
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.welcome-foot {
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+}
+
+.welcome-keys,
+.welcome-version {
+  font-size: var(--fs-caption);
+  color: var(--text-mute);
+  text-align: center;
+}
+
+/* —— 新建项目的比例预设 ——
+ * 图标是相同高度、不同宽高比的框：形状本身就提示比例，配文字标签更明确。 */
+.preset-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-2);
+}
+
+.preset-btn {
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+  padding: var(--sp-2) 4px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-sunken);
+  color: var(--text-dim);
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.preset-btn:hover {
+  border-color: var(--accent);
+  background: var(--bg-panel-2);
+  color: var(--text);
+}
+
+.preset-icon svg {
+  width: 26px;
+  height: 26px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+}
+
+.preset-label {
+  font-size: var(--fs-caption);
+}
+
+/* —— 数字框：输入区 + 自绘的上下箭头 ——
+ * 用真正的 <button> 而不是「背景图 + 把原生箭头设透明」：
+ * 后者背景图没有命中区域、透明后的原生箭头也不响应，结果两个都点不了。 */
+.num-field {
+  display: inline-flex;
+  align-items: stretch;
+  height: var(--h-control);
+  overflow: hidden;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: #000;
+}
+
+/* 包装内的输入框不再自带边框/背景，由外层统一 */
+.num-field input[type='number'] {
+  width: 62px;
+  padding: 0 var(--sp-2) 0 var(--sp-2);
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+/* 藏掉原生箭头（这里用的是我们自己的按钮） */
+.num-field input[type='number']::-webkit-inner-spin-button,
+.num-field input[type='number']::-webkit-outer-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+.num-steps {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  /* 收紧：原先两行撑满整个 30px 高（每格 15px），两个箭头看着离得很远 */
+  align-self: center;
+  width: 16px;
+  height: 18px;
+  margin-right: 3px;
+  border-radius: var(--r-chip);
+  overflow: hidden;
+}
+
+.num-step {
+  display: block;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 6px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.num-step:hover {
+  background: var(--bg-panel-2);
+}
+
+.num-step:active {
+  background: var(--selected);
+}
+
+/* 对话框里的数字框要撑满容器。
+ * 否则输入框固定 62px 宽，而容器很宽，箭头就落在中间而不是右边。 */
+.field .num-field,
+.prop-row .num-field {
+  display: flex;
+  width: 100%;
+}
+
+.field .num-field input[type='number'],
+.prop-row .num-field input[type='number'] {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
+
+/* 图层面板右上角那个不透明度框：内容自适应，不撑满 */
+.opacity-field {
+  width: auto;
+  min-width: 78px;
+}
